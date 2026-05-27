@@ -11,6 +11,8 @@ PAIRS = [
     "ARBUSDT","OPUSDT","DOTUSDT","UNIUSDT","ATOMUSDT"
 ]
 
+BINANCE = "https://api.binance.com/api/v3"
+
 def send(msg):
     try:
         requests.post(f"{API}/sendMessage",
@@ -19,15 +21,15 @@ def send(msg):
         print(f"Erro telegram: {e}")
 
 def get_klines(symbol):
-    r = requests.get(
-        f"https://fapi.binance.com/fapi/v1/klines",
-        params={"symbol":symbol,"interval":"1h","limit":55},
-        timeout=15)
-    return r.json()
+    r = requests.get(f"{BINANCE}/klines",
+        params={"symbol":symbol,"interval":"1h","limit":55},timeout=15)
+    data = r.json()
+    if isinstance(data, dict) and "code" in data:
+        raise Exception(f"API erro: {data.get('msg','?')}")
+    return data
 
 def get_ticker(symbol):
-    r = requests.get(
-        f"https://fapi.binance.com/fapi/v1/ticker/24hr",
+    r = requests.get(f"{BINANCE}/ticker/24hr",
         params={"symbol":symbol},timeout=10)
     return r.json()
 
@@ -58,7 +60,6 @@ def analyze():
             ticker = get_ticker(sym)
             price = float(ticker["lastPrice"])
             change = float(ticker["priceChangePercent"])
-            vol24 = float(ticker["quoteVolume"])
 
             r = rsi(closes)
             e20 = ema(closes[-20:], 20)
@@ -71,10 +72,10 @@ def analyze():
             elif r < 40: score+=1; reasons.append("RSI baixo")
             elif r > 70: score-=3; reasons.append("RSI sobrecomprado")
             elif r > 60: score-=1; reasons.append("RSI alto")
-            if bull: score+=2; reasons.append("EMA20 > EMA50")
-            else: score-=2; reasons.append("EMA20 < EMA50")
-            if price > e20 and bull: score+=1; reasons.append("Preço acima EMA20")
-            elif price < e20 and not bull: score-=1; reasons.append("Preço abaixo EMA20")
+            if bull: score+=2; reasons.append("EMA20>EMA50")
+            else: score-=2; reasons.append("EMA20<EMA50")
+            if price > e20 and bull: score+=1
+            elif price < e20 and not bull: score-=1
             if change > 5: score+=1; reasons.append("Momentum forte")
             elif change < -5: score-=1; reasons.append("Queda forte")
 
@@ -83,7 +84,7 @@ def analyze():
             elif score <= -4:
                 signals.append((sym.replace("USDT",""), price, change, r, "🔴 SHORT FORTE", score, reasons))
 
-            time.sleep(0.3)
+            time.sleep(0.5)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
@@ -101,7 +102,6 @@ while True:
     print("A analisar mercado...")
     try:
         signals = analyze()
-        sym_set = {s[0] for s in signals}
         new = [s for s in signals if s[0] not in last]
         if new:
             msg = "📊 <b>SINAIS FUTUROS USDT</b>\n\n"
@@ -116,7 +116,7 @@ while True:
             send(msg)
         else:
             print("Sem novos sinais fortes.")
-        last = sym_set
+        last = {s[0] for s in signals}
     except Exception as e:
         print(f"Erro geral: {e}")
     time.sleep(3600)
