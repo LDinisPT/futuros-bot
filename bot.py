@@ -9,7 +9,7 @@ PAIRS = [
     ("XRPUSD","XRP"),("ADAUSD","ADA"),("DOTUSD","DOT"),
     ("LINKUSD","LINK"),("UNIUSD","UNI"),("ATOMUSD","ATOM"),
     ("LTCUSD","LTC"),("AVAXUSD","AVAX"),("NEARUSD","NEAR"),
-    ("AAVEUSD","AAVE"),("DOGEUSD","DOGE"),("MATICUSD","MATIC")
+    ("AAVEUSD","AAVE"),("DOGEUSD","DOGE")
 ]
 
 def send(msg):
@@ -52,6 +52,31 @@ def ema(closes, p):
     e = sum(closes[:p])/p
     for x in closes[p:]: e = x*k + e*(1-k)
     return e
+
+def calc_levels(price, signal, rsi_val):
+    # Stop loss e take profit baseados em volatilidade RSI
+    if rsi_val < 30:
+        sl_pct = 0.03  # 3% stop
+        tp1_pct = 0.05 # 5% TP1
+        tp2_pct = 0.10 # 10% TP2
+    elif rsi_val > 70:
+        sl_pct = 0.03
+        tp1_pct = 0.05
+        tp2_pct = 0.10
+    else:
+        sl_pct = 0.025
+        tp1_pct = 0.04
+        tp2_pct = 0.08
+
+    if "LONG" in signal:
+        sl   = price * (1 - sl_pct)
+        tp1  = price * (1 + tp1_pct)
+        tp2  = price * (1 + tp2_pct)
+    else:
+        sl   = price * (1 + sl_pct)
+        tp1  = price * (1 - tp1_pct)
+        tp2  = price * (1 - tp2_pct)
+    return sl, tp1, tp2
 
 def analyze():
     signals = []
@@ -99,7 +124,7 @@ def fmt(p):
     return f"{p:.6f}"
 
 print("Bot iniciado!")
-send("🤖 <b>FuturesScan Bot iniciado!</b>\nA analisar mercado a cada hora ⏱\nAlertas de sinais LONG/SHORT fortes no Telegram!")
+send("🤖 <b>FuturesScan Bot iniciado!</b>\nA analisar mercado a cada hora ⏱\nReceberás alertas com entrada, stop loss e take profit!")
 
 last = set()
 while True:
@@ -108,16 +133,23 @@ while True:
         signals = analyze()
         new = [s for s in signals if s[0] not in last]
         if new:
-            msg = "📊 <b>SINAIS CRIPTO</b>\n\n"
             for sym,price,change,rsi_v,label,score,reasons in new:
-                msg += f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD</b> {label}\n"
-                msg += f"   💲 ${fmt(price)}\n"
-                msg += f"   📈 24h: {change:+.2f}%\n"
-                msg += f"   📉 RSI: {rsi_v}\n"
-                msg += f"   ⚡ Score: {score:+d}/7\n"
-                msg += f"   📌 {', '.join(reasons)}\n\n"
-            msg += "⚠️ <i>Não é aconselhamento financeiro.</i>"
-            send(msg)
+                sl, tp1, tp2 = calc_levels(price, label, rsi_v)
+                direction = "LONG 📈" if "LONG" in label else "SHORT 📉"
+                arrow = "↑" if "LONG" in label else "↓"
+                msg  = f"{arrow} <b>{sym}/USD — {label}</b>\n"
+                msg += f"━━━━━━━━━━━━━━━\n"
+                msg += f"💲 <b>Entrada:</b> ${fmt(price)}\n"
+                msg += f"🛑 <b>Stop Loss:</b> ${fmt(sl)}\n"
+                msg += f"🎯 <b>Take Profit 1:</b> ${fmt(tp1)}\n"
+                msg += f"🎯 <b>Take Profit 2:</b> ${fmt(tp2)}\n"
+                msg += f"━━━━━━━━━━━━━━━\n"
+                msg += f"📉 RSI: {rsi_v}\n"
+                msg += f"⚡ Score: {score:+d}/7\n"
+                msg += f"📌 {', '.join(reasons)}\n"
+                msg += f"━━━━━━━━━━━━━━━\n"
+                msg += f"⚠️ <i>Verifica sempre o gráfico antes de entrar.\nNão é aconselhamento financeiro.</i>"
+                send(msg)
         else:
             print("Sem novos sinais fortes.")
         last = {s[0] for s in signals}
