@@ -1,4 +1,4 @@
-import os, time, requests
+import os, time, requests, threading
 
 TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -12,12 +12,103 @@ PAIRS = [
     ("AAVEUSD","AAVE"),("DOGEUSD","DOGE")
 ]
 
-def send(msg):
+pending = {}  # guarda sinais à espera de resposta
+last_update_id = 0
+
+def send(msg, chat_id=None):
     try:
         requests.post(f"{API}/sendMessage",
-            json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"},timeout=10)
+            json={"chat_id": chat_id or CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         print(f"Erro telegram: {e}")
+
+def get_updates():
+    global last_update_id
+    try:
+        r = requests.get(f"{API}/getUpdates",
+            params={"offset": last_update_id+1, "timeout": 10}, timeout=15)
+        data = r.json()
+        return data.get("result", [])
+    except:
+        return []
+
+def process_replies():
+    global last_update_id
+    updates = get_updates()
+    for u in updates:
+        last_update_id = u["update_id"]
+        msg = u.get("message", {})
+        text = msg.get("text", "").strip()
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        if chat_id == CHAT_ID and text and chat_id in pending:
+            try:
+                saldo = float(text.replace("$","").replace(",","."))
+                sig = pending.pop(chat_id)
+                send_full_signal(sig, saldo)
+            except:
+                send("⚠️ Valor inválido. Envia apenas o número. Ex: 500", chat_id)
+
+def fmt(p):
+    if p > 100: return f"{p:,.2f}"
+    if p > 1: return f"{p:.4f}"
+    return f"{p:.6f}"
+
+def calc_levels(price, signal, rsi_val):
+    if rsi_val < 30 or rsi_val > 70:
+        sl_pct, tp1_pct, tp2_pct = 0.03, 0.05, 0.10
+        alavancagem = 2
+    else:
+        sl_pct, tp1_pct, tp2_pct = 0.025, 0.04, 0.08
+        alavancagem = 3
+
+    if "LONG" in signal:
+        sl  = price * (1 - sl_pct)
+        tp1 = price * (1 + tp1_pct)
+        tp2 = price * (1 + tp2_pct)
+    else:
+        sl  = price * (1 + sl_pct)
+        tp1 = price * (1 - tp1_pct)
+        tp2 = price * (1 - tp2_pct)
+
+    return sl, tp1, tp2, alavancagem, sl_pct
+
+def send_full_signal(sig, saldo):
+    sym, price, change, rsi_v, label, score, reasons = sig
+    sl, tp1, tp2, alav, sl_pct = calc_levels(price, label, rsi_v)
+
+    risco_pct = 0.02  # 2% fixo
+    risco_usd = saldo * risco_pct
+    tamanho = round(risco_usd / sl_pct, 2)
+    tamanho = min(tamanho, saldo * alav)  # nunca passa a alavancagem máxima
+
+    lucro_tp1 = round(tamanho * (tp1/price - 1) * (1 if "LONG" in label else -1), 2)
+    lucro_tp2 = round(tamanho * (tp2/price - 1) * (1 if "LONG" in label else -1), 2)
+    perda_sl  = round(risco_usd, 2)
+
+    arrow = "↑" if "LONG" in label else "↓"
+    direction = "LONG 📈" if "LONG" in label else "SHORT 📉"
+
+    msg  = f"{arrow} <b>{sym}/USD — {label}</b>\n"
+    msg += f"━━━━━━━━━━━━━━━\n"
+    msg += f"💲 <b>Entrada:</b> ${fmt(price)}\n"
+    msg += f"🛑 <b>Stop Loss:</b> ${fmt(sl)}\n"
+    msg += f"🎯 <b>TP1:</b> ${fmt(tp1)}\n"
+    msg += f"🎯 <b>TP2:</b> ${fmt(tp2)}\n"
+    msg += f"━━━━━━━━━━━━━━━\n"
+    msg += f"💼 <b>GESTÃO DE RISCO</b>\n"
+    msg += f"💰 Saldo: ${saldo:,.0f}\n"
+    msg += f"⚡ Alavancagem sugerida: {alav}x\n"
+    msg += f"📊 Tamanho da posição: ${tamanho:,.0f}\n"
+    msg += f"━━━━━━━━━━━━━━━\n"
+    msg += f"❌ Se correr mal: −${perda_sl}\n"
+    msg += f"✅ Se bater TP1: +${lucro_tp1}\n"
+    msg += f"✅ Se bater TP2: +${lucro_tp2}\n"
+    msg += f"━━━━━━━━━━━━━━━\n"
+    msg += f"📉 RSI: {rsi_v} | ⚡ Score: {score:+d}/7\n"
+    msg += f"📌 {', '.join(reasons)}\n"
+    msg += f"━━━━━━━━━━━━━━━\n"
+    msg += f"⚠️ <i>Verifica o gráfico antes de entrar.\nNão é aconselhamento financeiro.</i>"
+    send(msg)
 
 def get_ohlc(pair):
     r = requests.get("https://api.kraken.com/0/public/OHLC",
@@ -52,31 +143,6 @@ def ema(closes, p):
     e = sum(closes[:p])/p
     for x in closes[p:]: e = x*k + e*(1-k)
     return e
-
-def calc_levels(price, signal, rsi_val):
-    # Stop loss e take profit baseados em volatilidade RSI
-    if rsi_val < 30:
-        sl_pct = 0.03  # 3% stop
-        tp1_pct = 0.05 # 5% TP1
-        tp2_pct = 0.10 # 10% TP2
-    elif rsi_val > 70:
-        sl_pct = 0.03
-        tp1_pct = 0.05
-        tp2_pct = 0.10
-    else:
-        sl_pct = 0.025
-        tp1_pct = 0.04
-        tp2_pct = 0.08
-
-    if "LONG" in signal:
-        sl   = price * (1 - sl_pct)
-        tp1  = price * (1 + tp1_pct)
-        tp2  = price * (1 + tp2_pct)
-    else:
-        sl   = price * (1 + sl_pct)
-        tp1  = price * (1 - tp1_pct)
-        tp2  = price * (1 - tp2_pct)
-    return sl, tp1, tp2
 
 def analyze():
     signals = []
@@ -118,41 +184,30 @@ def analyze():
             print(f"Erro {sym}: {e}")
     return signals
 
-def fmt(p):
-    if p > 100: return f"{p:,.2f}"
-    if p > 1: return f"{p:.4f}"
-    return f"{p:.6f}"
-
 print("Bot iniciado!")
-send("🤖 <b>FuturesScan Bot iniciado!</b>\nA analisar mercado a cada hora ⏱\nReceberás alertas com entrada, stop loss e take profit!")
+send("🤖 <b>FuturesScan Bot iniciado!</b>\nA analisar mercado a cada hora ⏱\nQuando houver sinal pergunto o teu saldo e calculo tudo!")
 
 last = set()
 while True:
-    print("A analisar mercado...")
-    try:
-        signals = analyze()
-        new = [s for s in signals if s[0] not in last]
-        if new:
-            for sym,price,change,rsi_v,label,score,reasons in new:
-                sl, tp1, tp2 = calc_levels(price, label, rsi_v)
-                direction = "LONG 📈" if "LONG" in label else "SHORT 📉"
-                arrow = "↑" if "LONG" in label else "↓"
-                msg  = f"{arrow} <b>{sym}/USD — {label}</b>\n"
-                msg += f"━━━━━━━━━━━━━━━\n"
-                msg += f"💲 <b>Entrada:</b> ${fmt(price)}\n"
-                msg += f"🛑 <b>Stop Loss:</b> ${fmt(sl)}\n"
-                msg += f"🎯 <b>Take Profit 1:</b> ${fmt(tp1)}\n"
-                msg += f"🎯 <b>Take Profit 2:</b> ${fmt(tp2)}\n"
-                msg += f"━━━━━━━━━━━━━━━\n"
-                msg += f"📉 RSI: {rsi_v}\n"
-                msg += f"⚡ Score: {score:+d}/7\n"
-                msg += f"📌 {', '.join(reasons)}\n"
-                msg += f"━━━━━━━━━━━━━━━\n"
-                msg += f"⚠️ <i>Verifica sempre o gráfico antes de entrar.\nNão é aconselhamento financeiro.</i>"
-                send(msg)
-        else:
-            print("Sem novos sinais fortes.")
-        last = {s[0] for s in signals}
-    except Exception as e:
-        print(f"Erro geral: {e}")
-    time.sleep(3600)
+    process_replies()
+    
+    if not hasattr(analyze, '_last_run') or time.time() - analyze._last_run >= 3600:
+        analyze._last_run = time.time()
+        print("A analisar mercado...")
+        try:
+            signals = analyze()
+            new = [s for s in signals if s[0] not in last]
+            if new:
+                for sig in new:
+                    sym = sig[0]
+                    label = sig[4]
+                    arrow = "↑" if "LONG" in label else "↓"
+                    pending[CHAT_ID] = sig
+                    send(f"🔔 <b>Sinal detetado!</b>\n\n{arrow} <b>{sym}/USD — {label}</b>\n\n💰 Qual é o teu saldo atual?\n<i>Responde apenas com o número. Ex: 500</i>")
+            else:
+                print("Sem novos sinais fortes.")
+            last = {s[0] for s in signals}
+        except Exception as e:
+            print(f"Erro geral: {e}")
+    
+    time.sleep(3)
