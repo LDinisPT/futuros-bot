@@ -5,13 +5,12 @@ CHAT_ID = os.environ["CHAT_ID"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 PAIRS = [
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT",
-    "BNBUSDT","ADAUSDT","LINKUSDT","AVAXUSDT","NEARUSDT",
-    "INJUSDT","SUIUSDT","PEPEUSDT","AAVEUSDT","WIFUSDT",
-    "ARBUSDT","OPUSDT","DOTUSDT","UNIUSDT","ATOMUSDT"
+    ("XBTUSD","BTC"),("ETHUSD","ETH"),("SOLUSD","SOL"),
+    ("XRPUSD","XRP"),("ADAUSD","ADA"),("DOTUSD","DOT"),
+    ("LINKUSD","LINK"),("UNIUSD","UNI"),("ATOMUSD","ATOM"),
+    ("LTCUSD","LTC"),("AVAXUSD","AVAX"),("NEARUSD","NEAR"),
+    ("AAVEUSD","AAVE"),("DOGEUSD","DOGE"),("MATICUSD","MATIC")
 ]
-
-BINANCE = "https://api.binance.com/api/v3"
 
 def send(msg):
     try:
@@ -20,18 +19,21 @@ def send(msg):
     except Exception as e:
         print(f"Erro telegram: {e}")
 
-def get_klines(symbol):
-    r = requests.get(f"{BINANCE}/klines",
-        params={"symbol":symbol,"interval":"1h","limit":55},timeout=15)
+def get_ohlc(pair):
+    r = requests.get("https://api.kraken.com/0/public/OHLC",
+        params={"pair":pair,"interval":60},timeout=15)
     data = r.json()
-    if isinstance(data, dict) and "code" in data:
-        raise Exception(f"API erro: {data.get('msg','?')}")
-    return data
+    if data["error"]: raise Exception(str(data["error"]))
+    key = list(data["result"].keys())[0]
+    return data["result"][key]
 
-def get_ticker(symbol):
-    r = requests.get(f"{BINANCE}/ticker/24hr",
-        params={"symbol":symbol},timeout=10)
-    return r.json()
+def get_ticker(pair):
+    r = requests.get("https://api.kraken.com/0/public/Ticker",
+        params={"pair":pair},timeout=10)
+    data = r.json()
+    if data["error"]: raise Exception(str(data["error"]))
+    key = list(data["result"].keys())[0]
+    return data["result"][key]
 
 def rsi(closes, p=14):
     if len(closes) < p+1: return 50
@@ -53,17 +55,18 @@ def ema(closes, p):
 
 def analyze():
     signals = []
-    for sym in PAIRS:
+    for pair, sym in PAIRS:
         try:
-            klines = get_klines(sym)
-            closes = [float(k[4]) for k in klines]
-            ticker = get_ticker(sym)
-            price = float(ticker["lastPrice"])
-            change = float(ticker["priceChangePercent"])
+            ohlc = get_ohlc(pair)
+            closes = [float(c[4]) for c in ohlc]
+            ticker = get_ticker(pair)
+            price = float(ticker["c"][0])
+            open24 = float(ticker["o"])
+            change = round((price - open24) / open24 * 100, 2)
 
             r = rsi(closes)
             e20 = ema(closes[-20:], 20)
-            e50 = ema(closes[-50:], 50)
+            e50 = ema(closes[-50:], 50) if len(closes) >= 50 else ema(closes, len(closes))
             bull = e20 > e50
 
             score = 0
@@ -72,19 +75,20 @@ def analyze():
             elif r < 40: score+=1; reasons.append("RSI baixo")
             elif r > 70: score-=3; reasons.append("RSI sobrecomprado")
             elif r > 60: score-=1; reasons.append("RSI alto")
-            if bull: score+=2; reasons.append("EMA20>EMA50")
-            else: score-=2; reasons.append("EMA20<EMA50")
+            if bull: score+=2; reasons.append("EMA20>EMA50 bullish")
+            else: score-=2; reasons.append("EMA20<EMA50 bearish")
             if price > e20 and bull: score+=1
             elif price < e20 and not bull: score-=1
             if change > 5: score+=1; reasons.append("Momentum forte")
             elif change < -5: score-=1; reasons.append("Queda forte")
 
             if score >= 4:
-                signals.append((sym.replace("USDT",""), price, change, r, "🟢 LONG FORTE", score, reasons))
+                signals.append((sym, price, change, r, "🟢 LONG FORTE", score, reasons))
             elif score <= -4:
-                signals.append((sym.replace("USDT",""), price, change, r, "🔴 SHORT FORTE", score, reasons))
+                signals.append((sym, price, change, r, "🔴 SHORT FORTE", score, reasons))
 
-            time.sleep(0.5)
+            print(f"{sym}: RSI={r} score={score}")
+            time.sleep(1)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
@@ -95,7 +99,7 @@ def fmt(p):
     return f"{p:.6f}"
 
 print("Bot iniciado!")
-send("🤖 <b>FuturesScan Bot iniciado!</b>\nA analisar mercado a cada hora ⏱\nVais receber alertas de sinais LONG/SHORT fortes!")
+send("🤖 <b>FuturesScan Bot iniciado!</b>\nA analisar mercado a cada hora ⏱\nAlertas de sinais LONG/SHORT fortes no Telegram!")
 
 last = set()
 while True:
@@ -104,9 +108,9 @@ while True:
         signals = analyze()
         new = [s for s in signals if s[0] not in last]
         if new:
-            msg = "📊 <b>SINAIS FUTUROS USDT</b>\n\n"
+            msg = "📊 <b>SINAIS CRIPTO</b>\n\n"
             for sym,price,change,rsi_v,label,score,reasons in new:
-                msg += f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USDT</b> {label}\n"
+                msg += f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD</b> {label}\n"
                 msg += f"   💲 ${fmt(price)}\n"
                 msg += f"   📈 24h: {change:+.2f}%\n"
                 msg += f"   📉 RSI: {rsi_v}\n"
