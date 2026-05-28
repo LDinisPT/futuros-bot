@@ -11,7 +11,7 @@ PAIRS = [
     ("XBTUSD","BTC"),("ETHUSD","ETH"),("SOLUSD","SOL"),
     ("XRPUSD","XRP"),("ADAUSD","ADA"),("DOTUSDT","DOT"),
     ("LINKUSD","LINK"),("UNIUSD","UNI"),("ATOMUSD","ATOM"),
-    ("LTCUSD","LTC"),("XDGUSD","DOGE"),("AAVEUSDT","AAVE")
+    ("LTCUSD","LTC"),("XDGUSD","DOGE"),("AAVEUSD","AAVE")
 ]
 
 pending = {}
