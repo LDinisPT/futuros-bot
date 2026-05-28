@@ -1,5 +1,4 @@
 import os, time, requests, io
-import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -34,6 +33,7 @@ def send_photo(buf, caption):
             files={"photo":("chart.png",buf,"image/png")},timeout=20)
     except Exception as e:
         print(f"Erro foto: {e}")
+        send(caption)
 
 def get_updates():
     global last_update_id
@@ -70,87 +70,164 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         lows   = [float(c[3]) for c in candles]
         closes = [float(c[4]) for c in candles]
         xs = list(range(len(candles)))
-
         fig, ax = plt.subplots(figsize=(10,5))
         fig.patch.set_facecolor('#0d1318')
         ax.set_facecolor('#0d1318')
-
         for i, x in enumerate(xs):
             o,h,l,c = opens[i],highs[i],lows[i],closes[i]
             color = '#00e676' if c >= o else '#ff3d5a'
             ax.plot([x,x],[l,h], color=color, linewidth=0.8)
-            ax.add_patch(plt.Rectangle((x-0.3,min(o,c)),0.6,abs(c-o),
-                color=color, zorder=3))
-
+            ax.add_patch(plt.Rectangle((x-0.3,min(o,c)),0.6,abs(c-o),color=color,zorder=3))
         ax.plot(xs, ema20[-50:], color='#4a9eff', linewidth=1.2, label='EMA20', zorder=4)
         ax.plot(xs, ema50[-50:], color='#ffd166', linewidth=1.2, label='EMA50', zorder=4)
-
         ax.axhline(price, color='#ffffff', linewidth=1.2, linestyle='--', label=f'Entrada ${fmt(price)}')
-        ax.axhline(sl,    color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
-        ax.axhline(tp1,   color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
-        ax.axhline(tp2,   color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
-
-        ax.axhspan(min(price,tp2),max(price,tp2), alpha=0.07, color='#00e676')
-        ax.axhspan(min(price,sl), max(price,sl),  alpha=0.07, color='#ff3d5a')
-
-        mid_x = len(xs)*0.75
-        dy = (tp1-price)*0.5
-        ax.annotate('', xy=(mid_x,price+dy), xytext=(mid_x,price),
-            arrowprops=dict(arrowstyle='->',
-            color='#00e676' if "LONG" in signal else '#ff3d5a', lw=2.5))
-
+        ax.axhline(sl, color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
+        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
+        ax.axhline(tp2, color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
         ax.tick_params(colors='#4a6070', labelsize=7)
         for spine in ax.spines.values(): spine.set_color('#1a2430')
         ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
         ax.xaxis.set_tick_params(labelbottom=False)
         ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
-        direction = "LONG 📈" if "LONG" in signal else "SHORT 📉"
-        ax.set_title(f'{sym}/USD — {direction}  |  Últimas 50 velas (1h)',
-            color='#c8d8e8', fontsize=10, pad=10)
-        ax.legend(loc='upper left', fontsize=7,
-            facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
-
+        direction = "LONG" if "LONG" in signal else "SHORT"
+        ax.set_title(f'{sym}/USD - {direction} | 50 velas (1h)', color='#c8d8e8', fontsize=10, pad=10)
+        ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
         plt.tight_layout()
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=130, facecolor='#0d1318')
+        plt.savefig(buf, format='png', dpi=120, facecolor='#0d1318')
         plt.close()
         return buf
     except Exception as e:
-        print(f"Erro gráfico: {e}")
+        print(f"Erro grafico: {e}")
         return None
 
-def send_full_signal(sig, saldo, ohlc_data, ema20_arr, ema50_arr):
+def send_full_signal(sig, saldo, ohlc, e20, e50):
     sym,price,change,rsi_v,label,score,reasons = sig
     sl,tp1,tp2,alav,sl_pct = calc_levels(price,label,rsi_v)
-    risco_usd = saldo*0.02
-    tamanho = min(round(risco_usd/sl_pct,2), saldo*alav)
-    lucro_tp1 = round(tamanho*(abs(tp1-price)/price),2)
-    lucro_tp2 = round(tamanho*(abs(tp2-price)/price),2)
+    risco = saldo*0.02
+    tamanho = min(round(risco/sl_pct,2), saldo*alav)
+    lucro1 = round(tamanho*(abs(tp1-price)/price),2)
+    lucro2 = round(tamanho*(abs(tp2-price)/price),2)
     arrow = "↑" if "LONG" in label else "↓"
-
-    caption  = f"{arrow} <b>{sym}/USD — {label}</b>\n"
-    caption += f"━━━━━━━━━━━━━━━\n"
-    caption += f"💲 <b>Entrada:</b> ${fmt(price)}\n"
-    caption += f"🛑 <b>Stop Loss:</b> ${fmt(sl)}\n"
-    caption += f"🎯 <b>TP1:</b> ${fmt(tp1)}\n"
-    caption += f"🎯 <b>TP2:</b> ${fmt(tp2)}\n"
-    caption += f"━━━━━━━━━━━━━━━\n"
-    caption += f"💼 <b>GESTÃO DE RISCO</b>\n"
-    caption += f"💰 Saldo: ${saldo:,.0f}\n"
-    caption += f"⚡ Alavancagem: {alav}x\n"
-    caption += f"📊 Posição: ${tamanho:,.0f}\n"
-    caption += f"❌ Risco: −${round(risco_usd,2)}\n"
-    caption += f"✅ TP1: +${lucro_tp1} | TP2: +${lucro_tp2}\n"
-    caption += f"━━━━━━━━━━━━━━━\n"
-    caption += f"📉 RSI: {rsi_v} | ⚡ Score: {score:+d}/7\n"
-    caption += f"📌 {', '.join(reasons)}\n"
-    caption += f"⚠️ <i>Não é aconselhamento financeiro.</i>"
-
-    buf = make_chart(ohlc_data, price, sl, tp1, tp2, sym, label, ema20_arr, ema50_arr)
-    if buf:
-        send_photo(buf, caption)
-    else:
-        send(caption)
+    cap  = f"{arrow} <b>{sym}/USD — {label}</b>\n"
+    cap += "━━━━━━━━━━━━━━━\n"
+    cap += f"💲 <b>Entrada:</b> ${fmt(price)}\n"
+    cap += f"🛑 <b>Stop Loss:</b> ${fmt(sl)}\n"
+    cap += f"🎯 <b>TP1:</b> ${fmt(tp1)}\n"
+    cap += f"🎯 <b>TP2:</b> ${fmt(tp2)}\n"
+    cap += "━━━━━━━━━━━━━━━\n"
+    cap += f"💰 Saldo: ${saldo:,.0f}\n"
+    cap += f"⚡ Alavancagem: {alav}x\n"
+    cap += f"📊 Posição: ${tamanho:,.0f}\n"
+    cap += f"❌ Risco: −${round(risco,2)}\n"
+    cap += f"✅ TP1: +${lucro1} | TP2: +${lucro2}\n"
+    cap += "━━━━━━━━━━━━━━━\n"
+    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}/7\n"
+    cap += f"📌 {', '.join(reasons)}\n"
+    cap += "⚠️ <i>Não é aconselhamento financeiro.</i>"
+    buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
+    if buf: send_photo(buf, cap)
+    else: send(cap)
 
 def process_replies():
-    global
+    global last_update_id
+    for u in get_updates():
+        last_update_id = u["update_id"]
+        text = u.get("message",{}).get("text","").strip()
+        if not text or text.startswith("/"): continue
+        try:
+            saldo = float(text.replace("$","").replace(",","."))
+            if CHAT_ID in pending:
+                sig,ohlc,e20,e50 = pending[CHAT_ID]
+                send_full_signal(sig, saldo, ohlc, e20, e50)
+            else:
+                send("⚠️ Não há sinal pendente.")
+        except:
+            if CHAT_ID in pending:
+                send("⚠️ Envia só o número. Ex: 500")
+
+def rsi(c, p=14):
+    if len(c)<p+1: return 50
+    g=l=0
+    for i in range(len(c)-p,len(c)):
+        d=c[i]-c[i-1]
+        if d>0: g+=d
+        else: l-=d
+    ag,al=g/p,l/p
+    if al==0: return 100
+    return round(100-(100/(1+ag/al)),1)
+
+def ema_arr(c, p):
+    if len(c)<p: return [c[-1]]*len(c)
+    k=2/(p+1)
+    e=sum(c[:p])/p
+    r=list(c[:p])
+    for x in c[p:]:
+        e=x*k+e*(1-k)
+        r.append(e)
+    return r
+
+def get_ohlc(pair):
+    r=requests.get("https://api.kraken.com/0/public/OHLC",
+        params={"pair":pair,"interval":60},timeout=15)
+    d=r.json()
+    if d["error"]: raise Exception(str(d["error"]))
+    return d["result"][list(d["result"].keys())[0]]
+
+def get_ticker(pair):
+    r=requests.get("https://api.kraken.com/0/public/Ticker",
+        params={"pair":pair},timeout=10)
+    d=r.json()
+    if d["error"]: raise Exception(str(d["error"]))
+    return d["result"][list(d["result"].keys())[0]]
+
+def analyze():
+    global last_analysis
+    last_analysis=time.time()
+    signals=[]
+    for pair,sym in PAIRS:
+        try:
+            ohlc=get_ohlc(pair)
+            closes=[float(c[4]) for c in ohlc]
+            t=get_ticker(pair)
+            price=float(t["c"][0])
+            op=float(t["o"])
+            change=round((price-op)/op*100,2)
+            r=rsi(closes)
+            e20=ema_arr(closes,20)
+            e50=ema_arr(closes,50)
+            bull=e20[-1]>e50[-1]
+            score=0; reasons=[]
+            if r<30: score+=3; reasons.append("RSI sobrevendido")
+            elif r<40: score+=1; reasons.append("RSI baixo")
+            elif r>70: score-=3; reasons.append("RSI sobrecomprado")
+            elif r>60: score-=1; reasons.append("RSI alto")
+            if bull: score+=2; reasons.append("EMA bullish")
+            else: score-=2; reasons.append("EMA bearish")
+            if price>e20[-1] and bull: score+=1
+            elif price<e20[-1] and not bull: score-=1
+            if change>5: score+=1; reasons.append("Momentum forte")
+            elif change<-5: score-=1; reasons.append("Queda forte")
+            if score>=4:
+                signals.append(((sym,price,change,r,"🟢 LONG FORTE",score,reasons),ohlc,e20,e50))
+            elif score<=-4:
+                signals.append(((sym,price,change,r,"🔴 SHORT FORTE",score,reasons),ohlc,e20,e50))
+            print(f"{sym}: RSI={r} score={score}")
+            time.sleep(1)
+        except Exception as e:
+            print(f"Erro {sym}: {e}")
+    return signals
+
+print("Bot iniciado!")
+send("🤖 <b>FuturesScan Bot iniciado!</b>\nAnaliso o mercado a cada hora ⏱\nQuando houver sinal envio gráfico + gestão de risco!")
+
+last_syms=set()
+while True:
+    process_replies()
+    if time.time()-last_analysis>=3600:
+        print("A analisar mercado...")
+        try:
+            signals=analyze()
+            new=[s for s in signals if s[0][0] not in last_syms]
+            for item in new:
+                sig,ohlc,e
