@@ -3,7 +3,6 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
 TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
@@ -11,10 +10,10 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 
 PAIRS = [
     ("XBTUSD","BTC"),("ETHUSD","ETH"),("SOLUSD","SOL"),
-    ("XRPUSD","XRP"),("ADAUSD","ADA"),("DOTUSD","DOT"),
+    ("XRPUSD","XRP"),("ADAUSD","ADA"),("DOTUSDT","DOT"),
     ("LINKUSD","LINK"),("UNIUSD","UNI"),("ATOMUSD","ATOM"),
     ("LTCUSD","LTC"),("AVAXUSD","AVAX"),("NEARUSD","NEAR"),
-    ("AAVEUSD","AAVE"),("DOGEUSD","DOGE")
+    ("AAVEUSDT","AAVE"),("XDGUSD","DOGE")
 ]
 
 pending = {}
@@ -33,7 +32,7 @@ def send_photo(buf, caption):
         buf.seek(0)
         requests.post(f"{API}/sendPhoto",
             data={"chat_id":CHAT_ID,"caption":caption,"parse_mode":"HTML"},
-            files={"photo":("chart.png", buf, "image/png")},timeout=20)
+            files={"photo":("chart.png",buf,"image/png")},timeout=20)
     except Exception as e:
         print(f"Erro foto: {e}")
 
@@ -66,7 +65,6 @@ def calc_levels(price, signal, rsi_val):
 
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
     try:
-        # últimas 50 velas
         candles = ohlc[-50:]
         opens  = [float(c[1]) for c in candles]
         highs  = [float(c[2]) for c in candles]
@@ -78,53 +76,39 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         fig.patch.set_facecolor('#0d1318')
         ax.set_facecolor('#0d1318')
 
-        # velas
         for i, x in enumerate(xs):
             o,h,l,c = opens[i],highs[i],lows[i],closes[i]
             color = '#00e676' if c >= o else '#ff3d5a'
             ax.plot([x,x],[l,h], color=color, linewidth=0.8)
-            ax.add_patch(plt.Rectangle((x-0.3, min(o,c)), 0.6, abs(c-o),
+            ax.add_patch(plt.Rectangle((x-0.3,min(o,c)),0.6,abs(c-o),
                 color=color, zorder=3))
 
-        # EMA lines
         ax.plot(xs, ema20[-50:], color='#4a9eff', linewidth=1.2, label='EMA20', zorder=4)
         ax.plot(xs, ema50[-50:], color='#ffd166', linewidth=1.2, label='EMA50', zorder=4)
 
-        # níveis horizontais
-        n = len(xs)
-        is_long = "LONG" in signal
         ax.axhline(price, color='#ffffff', linewidth=1.2, linestyle='--', label=f'Entrada ${fmt(price)}')
         ax.axhline(sl,    color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
         ax.axhline(tp1,   color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
         ax.axhline(tp2,   color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
 
-        # zona de lucro/perda
-        ax.axhspan(min(price,tp2), max(price,tp2), alpha=0.07, color='#00e676')
-        ax.axhspan(min(price,sl),  max(price,sl),  alpha=0.07, color='#ff3d5a')
+        ax.axhspan(min(price,tp2),max(price,tp2), alpha=0.07, color='#00e676')
+        ax.axhspan(min(price,sl), max(price,sl),  alpha=0.07, color='#ff3d5a')
 
-        # seta de direção
-        mid_x = n * 0.75
-        arrow_y = price
-        dy = (tp1 - price) * 0.5
-        ax.annotate('', xy=(mid_x, arrow_y+dy), xytext=(mid_x, arrow_y),
-            arrowprops=dict(arrowstyle='->', color='#00e676' if is_long else '#ff3d5a',
-            lw=2.5))
+        mid_x = len(xs)*0.75
+        dy = (tp1-price)*0.5
+        ax.annotate('', xy=(mid_x,price+dy), xytext=(mid_x,price),
+            arrowprops=dict(arrowstyle='->',
+            color='#00e676' if "LONG" in signal else '#ff3d5a', lw=2.5))
 
-        # estilo
         ax.tick_params(colors='#4a6070', labelsize=7)
-        ax.spines['bottom'].set_color('#1a2430')
-        ax.spines['top'].set_color('#1a2430')
-        ax.spines['left'].set_color('#1a2430')
-        ax.spines['right'].set_color('#1a2430')
+        for spine in ax.spines.values(): spine.set_color('#1a2430')
         ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
         ax.xaxis.set_tick_params(labelbottom=False)
         ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
-
-        direction = "LONG 📈" if is_long else "SHORT 📉"
+        direction = "LONG 📈" if "LONG" in signal else "SHORT 📉"
         ax.set_title(f'{sym}/USD — {direction}  |  Últimas 50 velas (1h)',
             color='#c8d8e8', fontsize=10, pad=10)
-
-        legend = ax.legend(loc='upper left', fontsize=7,
+        ax.legend(loc='upper left', fontsize=7,
             facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
 
         plt.tight_layout()
@@ -180,15 +164,15 @@ def process_replies():
         try:
             saldo = float(text.replace("$","").replace(",","."))
             if CHAT_ID in pending:
-                sig, ohlc_data, ema20_arr, ema50_arr = pending[CHAT_ID]
-                send_full_signal(sig, saldo, ohlc_data, ema20_arr, ema50_arr)
+                sig,ohlc_data,e20,e50 = pending[CHAT_ID]
+                send_full_signal(sig, saldo, ohlc_data, e20, e50)
             else:
                 send("⚠️ Não há sinal pendente neste momento.")
         except:
             if CHAT_ID in pending:
                 send("⚠️ Valor inválido. Envia só o número. Ex: 500")
 
-def rsi(closes,p=14):
+def rsi(closes, p=14):
     if len(closes)<p+1: return 50
     g=l=0
     for i in range(len(closes)-p,len(closes)):
@@ -199,13 +183,11 @@ def rsi(closes,p=14):
     if al==0: return 100
     return round(100-(100/(1+ag/al)),1)
 
-def ema_arr(closes,p):
-    result=[]
-    if len(closes)<p:
-        return [closes[-1]]*len(closes)
+def ema_arr(closes, p):
+    if len(closes)<p: return [closes[-1]]*len(closes)
     k=2/(p+1)
     e=sum(closes[:p])/p
-    result=[closes[0]]*(p)
+    result=list(closes[:p])
     for x in closes[p:]:
         e=x*k+e*(1-k)
         result.append(e)
@@ -255,9 +237,9 @@ def analyze():
             if change>5: score+=1; reasons.append("Momentum forte")
             elif change<-5: score-=1; reasons.append("Queda forte")
             if score>=4:
-                signals.append(((sym,price,change,r,"🟢 LONG FORTE",score,reasons), ohlc, e20, e50))
+                signals.append(((sym,price,change,r,"🟢 LONG FORTE",score,reasons),ohlc,e20,e50))
             elif score<=-4:
-                signals.append(((sym,price,change,r,"🔴 SHORT FORTE",score,reasons), ohlc, e20, e50))
+                signals.append(((sym,price,change,r,"🔴 SHORT FORTE",score,reasons),ohlc,e20,e50))
             print(f"{sym}: RSI={r} score={score}")
             time.sleep(1)
         except Exception as e:
