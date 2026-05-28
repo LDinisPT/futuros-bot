@@ -230,4 +230,13 @@ while True:
             signals=analyze()
             new=[s for s in signals if s[0][0] not in last_syms]
             for item in new:
-                sig,ohlc,e
+                sig,ohlc,e20,e50=item
+                sym=sig[0]; label=sig[4]
+                pending[CHAT_ID]=(sig,ohlc,e20,e50)
+                arrow="↑" if "LONG" in label else "↓"
+                send(f"🔔 <b>Sinal detetado!</b>\n\n{arrow} <b>{sym}/USD — {label}</b>\n\n💰 Qual é o teu saldo?\n<i>Responde com o número. Ex: 500</i>")
+            if not new: print("Sem novos sinais.")
+            last_syms={s[0][0] for s in signals}
+        except Exception as e:
+            print(f"Erro geral: {e}")
+    time.sleep(3)
