@@ -15,6 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
+VERSAO = "v4"
 
 pending = {}
 last_update_id = 0
@@ -184,6 +185,16 @@ def bg_place_trailing(symbol, is_long, size, trigger, callback):
         "triggerType":"mark_price", "side":side, "reduceOnly":"YES", "orderType":"market"
     })
 
+def bg_close_position(symbol):
+    return bg_request("POST", "/api/v2/mix/order/close-positions", {
+        "symbol": symbol, "productType": "USDT-FUTURES"
+    })
+
+def bg_cancel_all(symbol):
+    return bg_request("POST", "/api/v2/mix/order/cancel-all-orders", {
+        "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT"
+    })
+
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
     sl_m, tp1_m, tp2_m = 1.8, 2.8, 5.0
@@ -288,7 +299,7 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         ax.xaxis.set_tick_params(labelbottom=False)
         ax.grid(color='#1a2430',linewidth=0.5,alpha=0.5)
         d="LONG" if "LONG" in signal else "SHORT"
-        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h)',color='#c8d8e8',fontsize=10,pad=10)
+        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) {VERSAO}',color='#c8d8e8',fontsize=10,pad=10)
         ax.legend(loc='upper left',fontsize=7,facecolor='#0d1318',edgecolor='#1a2430',labelcolor='#c8d8e8')
         plt.tight_layout()
         buf=io.BytesIO(); plt.savefig(buf,format='png',dpi=120,facecolor='#0d1318'); plt.close()
@@ -414,6 +425,100 @@ def forcar_teste(symbol):
     except Exception as e:
         send(f"⚠️ Erro no teste: {e}")
 
+def mostrar_saldo():
+    resp = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
+    if resp.get("code") != "00000":
+        send(f"⚠️ Erro ao obter saldo: {resp.get('msg','?')}"); return
+    data = resp.get("data", [])
+    if not data:
+        send("📭 Sem dados de conta."); return
+    a = data[0]
+    equity = float(a.get("accountEquity", a.get("usdtEquity",0)))
+    avail = float(a.get("available", 0))
+    upl = float(a.get("unrealizedPL", 0))
+    m  = f"💰 <b>SALDO BITGET</b>\n━━━━━━━━━━━━━━━\n"
+    m += f"💵 Total (equity): ${equity:.2f}\n"
+    m += f"✅ Disponível: ${avail:.2f}\n"
+    m += f"📊 L/P não realizado: ${upl:+.2f}"
+    send(m)
+
+def mostrar_posicoes():
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    if resp.get("code") != "00000":
+        send(f"⚠️ Erro: {resp.get('msg','?')}"); return
+    pos = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0]
+    if not pos:
+        send("📭 Sem posições abertas."); return
+    m = f"📊 <b>POSIÇÕES ABERTAS ({len(pos)})</b>\n"
+    for p in pos:
+        sym = p.get("symbol","?"); side = p.get("holdSide","?")
+        total = float(p.get("total",0)); entry = float(p.get("openPriceAvg",0))
+        upl = float(p.get("unrealizedPL",0)); marg = float(p.get("marginSize",0))
+        liq = float(p.get("liquidationPrice",0) or 0)
+        roe = (upl/marg*100) if marg else 0
+        arrow = "↑" if side=="long" else "↓"
+        m += f"━━━━━━━━━━━━━━━\n"
+        m += f"{arrow} <b>{sym}</b> {side.upper()}\n"
+        m += f"📊 Size: {total} | 💲 Entrada: ${fmt(entry)}\n"
+        m += f"💰 L/P: ${upl:+.4f} ({roe:+.1f}%)\n"
+        m += f"💥 Liquidação: ${fmt(liq)}"
+    send(m)
+
+def fechar_posicao(symbol):
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"): symbol += "USDT"
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    pos = None
+    for p in resp.get("data", []):
+        if p.get("symbol")==symbol and float(p.get("total",0))>0:
+            pos = p; break
+    if not pos:
+        send(f"📭 Não há posição aberta em <b>{symbol}</b>."); return
+    upl = float(pos.get("unrealizedPL",0))
+    r = bg_close_position(symbol)
+    if r.get("code")=="00000":
+        bg_cancel_all(symbol)
+        send(f"✅ <b>{symbol} FECHADA!</b>\n💰 L/P: ~${upl:+.4f}\n🧹 Ordens SL/TP/trailing canceladas.\n⚠️ Confirma na Bitget.")
+    else:
+        send(f"❌ Erro ao fechar: {r.get('msg','?')}")
+
+def mostrar_ganhos():
+    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"50"})
+    if resp.get("code")!="00000":
+        send(f"⚠️ Erro: {resp.get('msg','?')}"); return
+    d = resp.get("data")
+    lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
+    if not lista:
+        send("📭 Sem histórico de trades fechados."); return
+    total=0; wins=0; losses=0; linhas=[]
+    for p in lista:
+        sym=p.get("symbol","?")
+        pnl=float(p.get("netProfit") or p.get("pnl") or 0)
+        total+=pnl
+        if pnl>0: wins+=1
+        elif pnl<0: losses+=1
+        linhas.append(f"{'🟢' if pnl>=0 else '🔴'} {sym}: ${pnl:+.2f}")
+    m=f"📒 <b>HISTÓRICO ({len(lista)} trades)</b>\n━━━━━━━━━━━━━━━\n"
+    m+="\n".join(linhas[:15])
+    m+=f"\n━━━━━━━━━━━━━━━\n✅ {wins} ganhos | ❌ {losses} perdas\n"
+    m+=f"💰 <b>TOTAL: ${total:+.2f}</b>"
+    send(m)
+
+def mostrar_ajuda():
+    m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
+    m += "/saldo → saldo da conta\n"
+    m += "/posicoes → posições abertas\n"
+    m += "/ganhos → histórico e total\n"
+    m += "/fechar SOL → fecha posição\n"
+    m += "/teste LTC → forçar sinal\n"
+    m += "/ajuda → esta lista\n━━━━━━━━━━━━━━━\n"
+    m += "<b>Ao receber sinal:</b>\n"
+    m += "sim 5 → SL + TP fixo\n"
+    m += "sim 5 trail → trailing\n"
+    m += "sim 5 hibrido → 50% TP + 50% trailing\n"
+    m += "não → cancelar"
+    send(m)
+
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -422,6 +527,19 @@ def process_replies():
         if not text: continue
         if text.startswith("/teste"):
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
+        if text.startswith("/saldo"):
+            mostrar_saldo(); continue
+        if text.startswith("/posicoes") or text.startswith("/posições"):
+            mostrar_posicoes(); continue
+        if text.startswith("/ganhos") or text.startswith("/historico") or text.startswith("/histórico"):
+            mostrar_ganhos(); continue
+        if text.startswith("/fechar"):
+            p=text.split()
+            if len(p)>1: fechar_posicao(p[1])
+            else: send("Usa: <b>/fechar SOL</b>")
+            continue
+        if text.startswith("/ajuda") or text.startswith("/start"):
+            mostrar_ajuda(); continue
         if text.startswith("/"): continue
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
@@ -444,9 +562,9 @@ def process_replies():
                 send("⚠️ Formato errado. Ex: <b>sim 5</b> ou <b>sim 5 hibrido</b>")
 
 # ==================== LOOP ====================
-modo = "🔬 DRY RUN (teste)" if DRY_RUN else "💵 REAL"
-print(f"Bot iniciado! Modo: {modo}")
-send(f"🤖 <b>FuturesScan Bot</b>\nModo: <b>{modo}</b>\n⚡ Máx {MAX_LEV}x | Trailing {CALLBACK_RATIO}%\n🧪 Testa: <b>/teste LTC</b>")
+estado = "🔬 DRY RUN (teste)" if DRY_RUN else "💵 REAL"
+print(f"Bot iniciado {VERSAO}! Modo: {estado}")
+send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\nModo: <b>{estado}</b>\n⚡ Máx {MAX_LEV}x | Trailing {CALLBACK_RATIO}%\nEscreve <b>/ajuda</b> para ver os comandos.")
 
 while True:
     process_replies()
