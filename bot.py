@@ -13,7 +13,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = True   # <<< True = simula sem dinheiro. Mudar para False quando confirmado.
+DRY_RUN = False   # <<< True = simula sem dinheiro. Mudar para False quando confirmado.
 
 pending = {}
 last_update_id = 0
