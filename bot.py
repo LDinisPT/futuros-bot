@@ -21,7 +21,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = False   # Muda para True apenas para testes sem abrir ordens reais
+DRY_RUN = False
 
 pending = {}
 last_update_id = 0
@@ -125,7 +125,6 @@ ORIGINAL_PAIRS = [
 
 PAIRS = get_dynamic_pairs()
 
-# ==================== PRECISÃO DO CONTRATO (v3.3) ====================
 contract_precision = {}
 def get_contract_precision(bgsym):
     if bgsym in contract_precision:
@@ -149,7 +148,6 @@ def calc_size(notional, price, bgsym):
     size = round(s * multiplier) / multiplier
     return max(size, 0.001)
 
-# ==================== RESTO DAS FUNÇÕES ====================
 def check_open_position(symbol):
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
     if resp.get("code") != "00000": return False
@@ -237,88 +235,4 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         ax.plot(xs, ema50[-50:], color='#ffd166', linewidth=1.2, label='EMA50')
         ax.axhline(price, color='#ffffff', linewidth=1.2, linestyle='--', label=f'Entrada ${fmt(price)}')
         ax.axhline(sl, color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
-        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
-        ax.axhline(tp2, color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
-        ax.tick_params(colors='#4a6070', labelsize=7)
-        for sp in ax.spines.values(): sp.set_color('#1a2430')
-        ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
-        ax.xaxis.set_tick_params(labelbottom=False)
-        ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
-        d = "LONG" if "LONG" in signal else "SHORT"
-        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.3', color='#c8d8e8', fontsize=10, pad=10)
-        ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
-        plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=120, facecolor='#0d1318')
-        plt.close()
-        return buf
-    except Exception as e:
-        print(f"Erro gráfico: {e}")
-        return None
-
-# ==================== INDICADORES ====================
-def ema_arr(closes, period):
-    if len(closes) < period:
-        return [closes[-1]] * len(closes)
-    k = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    result = list(closes[:period])
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
-        result.append(ema)
-    return result
-
-def macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow: return 0, 0, 0
-    ema_fast = ema_arr(closes, fast)
-    ema_slow = ema_arr(closes, slow)
-    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-    signal_line = ema_arr(macd_line, signal)
-    histogram = macd_line[-1] - signal_line[-1]
-    return macd_line[-1], signal_line[-1], histogram
-
-def atr(highs, lows, closes, period=14):
-    if len(highs) < period + 1: return 0.0
-    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(1, len(highs))]
-    atr_val = sum(trs[:period]) / period
-    for i in range(period, len(trs)):
-        atr_val = (atr_val * (period - 1) + trs[i]) / period
-    return atr_val
-
-def rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
-    gains = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [abs(min(closes[i] - closes[i-1], 0)) for i in range(1, len(closes))]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
-
-# ==================== ANÁLISE ====================
-def analyze():
-    global last_analysis
-    last_analysis = time.time()
-    signals = []
-    for pair, sym, bgsym in PAIRS:
-        try:
-            ohlc_data = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": 60}, timeout=15).json()
-            ohlc = ohlc_data["result"][list(ohlc_data["result"].keys())[0]]
-            closes = [float(c[4]) for c in ohlc]
-            highs = [float(c[2]) for c in ohlc]
-            lows = [float(c[3]) for c in ohlc]
-            ticker_data = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair}, timeout=10).json()
-            t = ticker_data["result"][list(ticker_data["result"].keys())[0]]
-            price = float(t["c"][0])
-            op = float(t["o"])
-            change = round((price - op) / op * 100, 2)
-
-            r = rsi(closes)
-            e20 = ema_arr(closes, 20)
-            e50 = ema_arr(closes, 50)
-            bull = e20[-1] > e50[-1]
-            macd_line, signal_line, hist = macd(closes)
-            atr_val = atr(highs, lows, closes)
+        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle
