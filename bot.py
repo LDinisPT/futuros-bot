@@ -80,41 +80,44 @@ def bg_request(method, path, body_dict=None):
         print(f"Erro Bitget: {e}")
         return {"code": "99999", "msg": str(e)}
 
-# ==================== PARES DINÂMICOS v3.2 ====================
+# ==================== PARES DINÂMICOS v3.2 (corrigido) ====================
 def get_dynamic_pairs():
-    """Busca automaticamente todos os pares USDT-FUTURES da Bitget"""
-    resp = bg_request("GET", "/api/v2/mix/market/contracts", {"productType": "USDT-FUTURES"})
-    if resp.get("code") != "00000" or not resp.get("data"):
-        print("⚠️ Erro ao buscar pares da Bitget - usando lista fallback")
+    """Busca todos os pares USDT-FUTURES da Bitget (chamada pública)"""
+    try:
+        url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
+        r = requests.get(url, timeout=15)
+        data = r.json()
+        if data.get("code") != "00000" or not data.get("data"):
+            raise Exception("Resposta inválida da Bitget")
+
+        contracts = data.get("data", [])
+        kraken_map = {
+            "BTCUSDT": ("XBTUSD", "BTC"), "ETHUSDT": ("ETHUSD", "ETH"),
+            "SOLUSDT": ("SOLUSD", "SOL"), "XRPUSDT": ("XRPUSD", "XRP"),
+            "ADAUSDT": ("ADAUSD", "ADA"), "DOTUSDT": ("DOTUSDT", "DOT"),
+            "LINKUSDT": ("LINKUSD", "LINK"), "UNIUSDT": ("UNIUSD", "UNI"),
+            "ATOMUSDT": ("ATOMUSD", "ATOM"), "LTCUSDT": ("LTCUSD", "LTC"),
+            "DOGEUSDT": ("XDGUSD", "DOGE"), "AAVEUSDT": ("AAVEUSD", "AAVE"),
+            "AVAXUSDT": ("AVAXUSD", "AVAX"), "NEARUSDT": ("NEARUSD", "NEAR"),
+            "TRXUSDT": ("TRXUSD", "TRX"), "BCHUSDT": ("BCHUSD", "BCH"),
+            "FILUSDT": ("FILUSD", "FIL"), "ETCUSDT": ("ETCUSD", "ETC"),
+            "SUIUSDT": ("SUIUSD", "SUI"), "TONUSDT": ("TONUSD", "TON"),
+            "INJUSDT": ("INJUSD", "INJ"),
+        }
+
+        dynamic_pairs = []
+        for c in contracts:
+            symbol = c.get("symbol")
+            if symbol in kraken_map:
+                kraken_pair, display_sym = kraken_map[symbol]
+                dynamic_pairs.append((kraken_pair, display_sym, symbol))
+
+        print(f"✅ Carregados {len(dynamic_pairs)} pares dinâmicos da Bitget")
+        return dynamic_pairs
+    except Exception as e:
+        print(f"⚠️ Erro ao buscar pares da Bitget: {e} - usando lista fallback")
         return ORIGINAL_PAIRS
 
-    contracts = resp.get("data", [])
-    # Mapeamento Kraken <-> Bitget
-    kraken_map = {
-        "BTCUSDT": ("XBTUSD", "BTC"), "ETHUSDT": ("ETHUSD", "ETH"),
-        "SOLUSDT": ("SOLUSD", "SOL"), "XRPUSDT": ("XRPUSD", "XRP"),
-        "ADAUSDT": ("ADAUSD", "ADA"), "DOTUSDT": ("DOTUSDT", "DOT"),
-        "LINKUSDT": ("LINKUSD", "LINK"), "UNIUSDT": ("UNIUSD", "UNI"),
-        "ATOMUSDT": ("ATOMUSD", "ATOM"), "LTCUSDT": ("LTCUSD", "LTC"),
-        "DOGEUSDT": ("XDGUSD", "DOGE"), "AAVEUSDT": ("AAVEUSD", "AAVE"),
-        "AVAXUSDT": ("AVAXUSD", "AVAX"), "NEARUSDT": ("NEARUSD", "NEAR"),
-        "TRXUSDT": ("TRXUSD", "TRX"), "BCHUSDT": ("BCHUSD", "BCH"),
-        "FILUSDT": ("FILUSD", "FIL"), "ETCUSDT": ("ETCUSD", "ETC"),
-        "SUIUSDT": ("SUIUSD", "SUI"), "TONUSDT": ("TONUSD", "TON"),
-        "INJUSDT": ("INJUSD", "INJ"), "PEPEUSDT": ("PEPEUSD", "PEPE"),
-    }
-
-    dynamic_pairs = []
-    for c in contracts:
-        symbol = c.get("symbol")
-        if symbol in kraken_map:
-            kraken_pair, display_sym = kraken_map[symbol]
-            dynamic_pairs.append((kraken_pair, display_sym, symbol))
-
-    print(f"✅ Carregados {len(dynamic_pairs)} pares dinâmicos da Bitget")
-    return dynamic_pairs
-
-# Lista de fallback caso a API da Bitget falhe
 ORIGINAL_PAIRS = [
     ("XBTUSD", "BTC", "BTCUSDT"), ("ETHUSD", "ETH", "ETHUSDT"),
     ("SOLUSD", "SOL", "SOLUSDT"), ("XRPUSD", "XRP", "XRPUSDT"),
@@ -226,10 +229,8 @@ def executar_trade(sig, bgsym, margem):
     lev = min(alav, MAX_LEV)
     notional = margem * lev
     size = calc_size(notional, price)
-
     r1 = bg_set_leverage(bgsym, lev)
     r2 = bg_place_order(bgsym, is_long, size, sl, tp1)
-
     if r2.get("code") == "00000":
         arrow = "↑" if is_long else "↓"
         m = f"✅ <b>POSIÇÃO ABERTA v3.2!</b>\n━━━━━━━━━━━━━━━\n"
@@ -246,7 +247,7 @@ def executar_trade(sig, bgsym, margem):
     else:
         send(f"❌ Erro ao abrir: {r2.get('msg','?')}")
 
-# ==================== GRÁFICO E ANÁLISE (mantido da v3.1) ====================
+# ==================== GRÁFICO ====================
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
     try:
         candles = ohlc[-50:]
@@ -286,6 +287,7 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         print(f"Erro gráfico: {e}")
         return None
 
+# ==================== ANÁLISE ====================
 def analyze():
     global last_analysis
     last_analysis = time.time()
@@ -395,7 +397,7 @@ def process_replies():
 
 # ==================== LOOP PRINCIPAL ====================
 print("🤖 Bot iniciado! (versão v3.2 — Pares Dinâmicos da Bitget)")
-send("🤖 <b>FuturesScan Bot v3.2</b>\n✅ Pares dinâmicos da Bitget + MACD + ATR + Funding Rate\nAnaliso a cada hora ⏱")
+send("🤖 <b>FuturesScan Bot v3.2</b>\n✅ Pares dinâmicos da Bitget (corrigido)\nAnaliso a cada hora ⏱")
 
 while True:
     process_replies()
