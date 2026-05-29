@@ -21,7 +21,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = False
+DRY_RUN = False   # ← Muda para True se quiseres testar sem abrir ordens reais
 
 pending = {}
 last_update_id = 0
@@ -80,7 +80,7 @@ def bg_request(method, path, body_dict=None):
         print(f"Erro Bitget: {e}")
         return {"code": "99999", "msg": str(e)}
 
-# ==================== PARES DINÂMICOS + PRECISÃO v3.3 ====================
+# ==================== PARES DINÂMICOS + PRECISÃO v3.4 ====================
 def get_dynamic_pairs():
     try:
         url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
@@ -146,8 +146,11 @@ def calc_size(notional, price, bgsym):
     s = notional / price
     multiplier = 10 ** precision
     size = round(s * multiplier) / multiplier
-    return max(size, 0.001)
+    size = max(size, 0.001)   # mínimo seguro
+    print(f"DEBUG - {bgsym} | Notional: ${notional} | Price: ${price} | Size calculado: {size}")
+    return size
 
+# ==================== RESTO DO CÓDIGO (funcional) ====================
 def check_open_position(symbol):
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
     if resp.get("code") != "00000": return False
@@ -185,7 +188,7 @@ def calc_levels(price, signal, atr_val):
 
 def executar_trade(sig, bgsym, margem):
     if DRY_RUN:
-        send("🔬 <b>DRY RUN ATIVADO (v3.3)</b>")
+        send("🔬 <b>DRY RUN ATIVADO (v3.4)</b>")
         return
     sym, price, _, rsi_v, label, score, reasons, atr_val = sig
     if check_open_position(bgsym):
@@ -200,7 +203,7 @@ def executar_trade(sig, bgsym, margem):
     r2 = bg_place_order(bgsym, is_long, size, sl, tp1)
     if r2.get("code") == "00000":
         arrow = "↑" if is_long else "↓"
-        m = f"✅ <b>POSIÇÃO ABERTA v3.3!</b>\n━━━━━━━━━━━━━━━\n"
+        m = f"✅ <b>POSIÇÃO ABERTA v3.4!</b>\n━━━━━━━━━━━━━━━\n"
         m += f"{arrow} <b>{sym}/USDT — {'LONG' if is_long else 'SHORT'}</b>\n"
         m += f"💲 Entrada: ~${fmt(price)}\n"
         m += f"⚡ Alavancagem: {lev}x\n"
@@ -214,7 +217,7 @@ def executar_trade(sig, bgsym, margem):
     else:
         send(f"❌ Erro ao abrir: {r2.get('msg','?')}")
 
-# ==================== GRÁFICO (corrigido) ====================
+# ==================== GRÁFICO ====================
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
     try:
         candles = ohlc[-50:]
@@ -243,7 +246,7 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         ax.xaxis.set_tick_params(labelbottom=False)
         ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
         d = "LONG" if "LONG" in signal else "SHORT"
-        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.3', color='#c8d8e8', fontsize=10, pad=10)
+        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.4', color='#c8d8e8', fontsize=10, pad=10)
         ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
         plt.tight_layout()
         buf = io.BytesIO()
@@ -363,7 +366,7 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym):
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
     lev = min(alav, MAX_LEV)
     arrow = "↑" if "LONG" in label else "↓"
-    cap = f"{arrow} <b>{sym}/USD — {label} v3.3</b>\n━━━━━━━━━━━━━━━\n"
+    cap = f"{arrow} <b>{sym}/USD — {label} v3.4</b>\n━━━━━━━━━━━━━━━\n"
     cap += f"💲 Entrada: ${fmt(price)}\n"
     cap += f"🛑 SL: ${fmt(sl)} (ATR)\n"
     cap += f"🎯 TP1: ${fmt(tp1)}\n"
@@ -405,13 +408,13 @@ def process_replies():
                 send(f"⚠️ Formato errado. Ex: <b>sim 5</b>")
 
 # ==================== LOOP PRINCIPAL ====================
-print("🤖 Bot iniciado! (versão v3.3 — Precisão de tamanho corrigida)")
-send("🤖 <b>FuturesScan Bot v3.3</b>\n✅ Pares dinâmicos + correção de tamanho\nPodes testar com $1 ou $2")
+print("🤖 Bot iniciado! (versão v3.4 — Precisão corrigida)")
+send("🤖 <b>FuturesScan Bot v3.4</b>\n✅ Pares dinâmicos + correção de tamanho\nPodes testar com $1 ou $2")
 
 while True:
     process_replies()
     if time.time() - last_analysis >= 3600:
-        print("A analisar mercado (v3.3)...")
+        print("A analisar mercado (v3.4)...")
         try:
             signals = analyze()
             for item in signals:
