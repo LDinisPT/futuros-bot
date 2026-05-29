@@ -80,7 +80,7 @@ def bg_request(method, path, body_dict=None):
         print(f"Erro Bitget: {e}")
         return {"code": "99999", "msg": str(e)}
 
-# ==================== PARES DINÂMICOS + PRECISÃO v3.5 ====================
+# ==================== PARES DINÂMICOS + PRECISÃO ====================
 def get_dynamic_pairs():
     try:
         url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
@@ -154,9 +154,10 @@ def calc_size(notional, price, bgsym):
 def round_price(price, bgsym):
     _, price_place = get_contract_precision(bgsym)
     multiplier = 10 ** price_place
-    return round(price * multiplier) / multiplier
+    rounded = round(price * multiplier) / multiplier
+    print(f"DEBUG PRICE - {bgsym} | Original: ${price:.6f} | Rounded: ${rounded:.6f}")
+    return rounded
 
-# ==================== LÓGICA DE TRADING ====================
 def check_open_position(symbol):
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
     if resp.get("code") != "00000": return False
@@ -178,25 +179,28 @@ def bg_set_leverage(symbol, lev):
 
 def bg_place_order(symbol, is_long, size, sl, tp):
     side = "buy" if is_long else "sell"
+    sl_rounded = round_price(sl, symbol)
+    tp_rounded = round_price(tp, symbol)
+    print(f"DEBUG ORDER - {symbol} | SL: ${sl_rounded:.6f} | TP: ${tp_rounded:.6f}")
     return bg_request("POST", "/api/v2/mix/order/place-order", {
-        "symbol": symbol, "productType": "USDT-FUTURES", "marginMode": "isolated",
-        "marginCoin": "USDT", "size": str(size), "side": side, "orderType": "market",
-        "presetStopSurplusPrice": str(round_price(tp, symbol)), 
-        "presetStopLossPrice": str(round_price(sl, symbol))
+        "symbol": symbol,
+        "productType": "USDT-FUTURES",
+        "marginMode": "isolated",
+        "marginCoin": "USDT",
+        "size": str(size),
+        "side": side,
+        "orderType": "market",
+        "presetStopSurplusPrice": str(tp_rounded),
+        "presetStopLossPrice": str(sl_rounded)
     })
 
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
     sl_mult = 1.8; tp1_mult = 2.8; tp2_mult = 5.0
     if "LONG" in signal:
-        sl = price - atr_val*sl_mult
-        tp1 = price + atr_val*tp1_mult
-        tp2 = price + atr_val*tp2_mult
+        return price - atr_val*sl_mult, price + atr_val*tp1_mult, price + atr_val*tp2_mult, 3
     else:
-        sl = price + atr_val*sl_mult
-        tp1 = price - atr_val*tp1_mult
-        tp2 = price - atr_val*tp2_mult
-    return sl, tp1, tp2, 3
+        return price + atr_val*sl_mult, price - atr_val*tp1_mult, price - atr_val*tp2_mult, 3
 
 def executar_trade(sig, bgsym, margem):
     if DRY_RUN:
@@ -269,7 +273,7 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         print(f"Erro gráfico: {e}")
         return None
 
-# ==================== INDICADORES (igual à anterior) ====================
+# ==================== INDICADORES ====================
 def ema_arr(closes, period):
     if len(closes) < period:
         return [closes[-1]] * len(closes)
@@ -420,8 +424,8 @@ def process_replies():
                 send(f"⚠️ Formato errado. Ex: <b>sim 5</b>")
 
 # ==================== LOOP PRINCIPAL ====================
-print("🤖 Bot iniciado! (versão v3.5 — Precisão total corrigida)")
-send("🤖 <b>FuturesScan Bot v3.5</b>\n✅ Pares dinâmicos + SL/TP arredondados\nPodes testar com $1 ou $2")
+print("🤖 Bot iniciado! (versão v3.5 — SL/TP corrigidos)")
+send("🤖 <b>FuturesScan Bot v3.5</b>\n✅ SL e TP agora são colocados corretamente\nPodes testar com $1 ou $2")
 
 while True:
     process_replies()
