@@ -13,8 +13,8 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-CALLBACK_RATIO = 2.5   # % do trailing stop
-DRY_RUN = False   # True = simula | False = dinheiro real
+CALLBACK_RATIO = 2.5
+DRY_RUN = False
 
 pending = {}
 last_update_id = 0
@@ -167,17 +167,18 @@ def bg_place_order(symbol, is_long, size, sl, tp=None):
         body["presetStopSurplusPrice"] = str(tp)
     return bg_request("POST", "/api/v2/mix/order/place-order", body)
 
-def bg_place_tpsl(symbol, hold_side, size, trigger, plan_type):
-    return bg_request("POST", "/api/v2/mix/order/place-tpsl-order", {
-        "marginCoin":"USDT", "productType":"USDT-FUTURES", "symbol":symbol,
-        "planType":plan_type, "triggerPrice":str(trigger), "triggerType":"mark_price",
-        "executePrice":"0", "holdSide":hold_side, "size":str(size)
+def bg_close_limit(symbol, is_long, size, price):
+    side = "sell" if is_long else "buy"
+    return bg_request("POST", "/api/v2/mix/order/place-order", {
+        "symbol":symbol, "productType":"USDT-FUTURES", "marginMode":"isolated",
+        "marginCoin":"USDT", "size":str(size), "side":side, "orderType":"limit",
+        "price":str(price), "reduceOnly":"YES"
     })
 
 def bg_place_trailing(symbol, is_long, size, trigger, callback):
     side = "sell" if is_long else "buy"
     return bg_request("POST", "/api/v2/mix/order/place-plan-order", {
-        "planType":"moving_plan", "symbol":symbol, "productType":"USDT-FUTURES",
+        "planType":"track_plan", "symbol":symbol, "productType":"USDT-FUTURES",
         "marginMode":"isolated", "marginCoin":"USDT", "size":str(size),
         "callbackRatio":str(callback), "triggerPrice":str(trigger),
         "triggerType":"mark_price", "side":side, "reduceOnly":"YES", "orderType":"market"
@@ -244,7 +245,7 @@ def executar_trade(sig, bgsym, margem, modo="normal"):
     elif modo == "hibrido":
         metade = round_size(size/2, bgsym)
         resto = round_size(size - metade, bgsym)
-        rtp = bg_place_tpsl(bgsym, hold_side, metade, tp1, "profit_plan")
+        rtp = bg_close_limit(bgsym, is_long, metade, tp1)
         rtr = bg_place_trailing(bgsym, is_long, resto, tp1, CALLBACK_RATIO)
         ok_tp = rtp.get("code") == "00000"
         ok_tr = rtr.get("code") == "00000"
