@@ -13,7 +13,8 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = False   # <<< True = simula sem dinheiro. Mudar para False quando confirmado.
+CALLBACK_RATIO = 2.5   # % do trailing stop
+DRY_RUN = False   # True = simula | False = dinheiro real
 
 pending = {}
 last_update_id = 0
@@ -128,6 +129,11 @@ def calc_size(notional, price, bgsym):
     print(f"SIZE {bgsym}: notional=${notional:.2f} price=${price:.4f} size={size}")
     return size
 
+def round_size(size, bgsym):
+    vp, _ = get_precision(bgsym)
+    m = 10 ** vp
+    return max(round(size * m) / m, 0.001)
+
 def round_price(price, bgsym):
     _, pp = get_precision(bgsym)
     m = 10 ** pp
@@ -150,12 +156,31 @@ def bg_set_leverage(symbol, lev):
         "symbol":symbol, "productType":"USDT-FUTURES", "marginCoin":"USDT", "leverage":str(lev)
     })
 
-def bg_place_order(symbol, is_long, size, sl, tp):
+def bg_place_order(symbol, is_long, size, sl, tp=None):
     side = "buy" if is_long else "sell"
-    return bg_request("POST", "/api/v2/mix/order/place-order", {
+    body = {
         "symbol":symbol, "productType":"USDT-FUTURES", "marginMode":"isolated",
         "marginCoin":"USDT", "size":str(size), "side":side, "orderType":"market",
-        "presetStopSurplusPrice":str(tp), "presetStopLossPrice":str(sl)
+        "presetStopLossPrice":str(sl)
+    }
+    if tp is not None:
+        body["presetStopSurplusPrice"] = str(tp)
+    return bg_request("POST", "/api/v2/mix/order/place-order", body)
+
+def bg_place_tpsl(symbol, hold_side, size, trigger, plan_type):
+    return bg_request("POST", "/api/v2/mix/order/place-tpsl-order", {
+        "marginCoin":"USDT", "productType":"USDT-FUTURES", "symbol":symbol,
+        "planType":plan_type, "triggerPrice":str(trigger), "triggerType":"mark_price",
+        "executePrice":"0", "holdSide":hold_side, "size":str(size)
+    })
+
+def bg_place_trailing(symbol, is_long, size, trigger, callback):
+    side = "sell" if is_long else "buy"
+    return bg_request("POST", "/api/v2/mix/order/place-plan-order", {
+        "planType":"moving_plan", "symbol":symbol, "productType":"USDT-FUTURES",
+        "marginMode":"isolated", "marginCoin":"USDT", "size":str(size),
+        "callbackRatio":str(callback), "triggerPrice":str(trigger),
+        "triggerType":"mark_price", "side":side, "reduceOnly":"YES", "orderType":"market"
     })
 
 def calc_levels(price, signal, atr_val):
@@ -165,43 +190,76 @@ def calc_levels(price, signal, atr_val):
         return price - atr_val*sl_m, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
     return price + atr_val*sl_m, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
 
-def executar_trade(sig, bgsym, margem):
+def executar_trade(sig, bgsym, margem, modo="normal"):
     sym, price, _, rsi_v, label, score, reasons, atr_val = sig
     is_long = "LONG" in label
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
-    sl = round_price(sl, bgsym)
-    tp1 = round_price(tp1, bgsym)
+    sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
     lev = min(alav, MAX_LEV)
     notional = margem * lev
     size = calc_size(notional, price, bgsym)
+    hold_side = "long" if is_long else "short"
     direcao = "LONG" if is_long else "SHORT"
+    arrow = "↑" if is_long else "↓"
 
     if DRY_RUN:
-        m  = f"🔬 <b>DRY RUN (simulação)</b>\n━━━━━━━━━━━━━━━\n"
-        m += f"{'↑' if is_long else '↓'} {sym}/USDT — {direcao}\n"
-        m += f"💲 Entrada: ~${fmt(price)}\n⚡ {lev}x | 💰 ${margem}\n"
-        m += f"📊 Size: {size}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n"
-        m += f"━━━━━━━━━━━━━━━\n✅ Se fosse real, abria isto.\n"
-        m += f"<i>(DRY_RUN ativo — nada foi executado)</i>"
+        m  = f"🔬 <b>DRY RUN — modo {modo.upper()}</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"{arrow} {sym}/USDT — {direcao}\n💲 Entrada: ~${fmt(price)}\n"
+        m += f"⚡ {lev}x | 💰 ${margem}\n📊 Size: {size}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n"
+        if modo == "normal":
+            m += "📋 TP1 fecha 100%\n"
+        elif modo == "trail":
+            m += f"📋 Trailing {CALLBACK_RATIO}% nos 100%\n"
+        elif modo == "hibrido":
+            metade = round_size(size/2, bgsym)
+            m += f"📋 TP1 fecha 50% ({metade}) + trailing {CALLBACK_RATIO}% nos restantes\n"
+        m += f"━━━━━━━━━━━━━━━\n<i>(DRY_RUN — nada executado)</i>"
         send(m)
         return
 
     if check_open_position(bgsym):
-        send(f"⚠️ Já tens posição aberta em <b>{sym}</b>. Não abri outra.")
+        send(f"⚠️ Já tens posição em <b>{sym}</b>. Não abri outra.")
         return
 
     bg_set_leverage(bgsym, lev)
-    r2 = bg_place_order(bgsym, is_long, size, sl, tp1)
-    if r2.get("code") == "00000":
-        m  = f"✅ <b>POSIÇÃO ABERTA!</b>\n━━━━━━━━━━━━━━━\n"
-        m += f"{'↑' if is_long else '↓'} <b>{sym}/USDT — {direcao}</b>\n"
-        m += f"💲 Entrada: ~${fmt(price)}\n⚡ {lev}x | 💰 ${margem}\n"
-        m += f"📊 Size: {size}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n"
-        m += f"━━━━━━━━━━━━━━━\n✅ SL e TP1 incluídos na ordem.\n"
-        m += f"⚠️ CONFIRMA na Bitget que o SL aparece!"
-        send(m)
+
+    if modo == "normal":
+        r = bg_place_order(bgsym, is_long, size, sl, tp1)
     else:
-        send(f"❌ Erro ao abrir: {r2.get('msg','?')} (cod {r2.get('code','?')})")
+        r = bg_place_order(bgsym, is_long, size, sl)
+
+    if r.get("code") != "00000":
+        send(f"❌ Erro ao abrir: {r.get('msg','?')} (cod {r.get('code','?')})")
+        return
+
+    extra = "TP1 fecha 100%"
+    avisos = []
+    if modo == "trail":
+        rt = bg_place_trailing(bgsym, is_long, size, tp1, CALLBACK_RATIO)
+        if rt.get("code") == "00000":
+            extra = f"Trailing {CALLBACK_RATIO}% (100%)"
+        else:
+            avisos.append(f"⚠️ Trailing falhou: {rt.get('msg','?')}\n(SL fixo continua a proteger)")
+            extra = "SL fixo (trailing falhou)"
+    elif modo == "hibrido":
+        metade = round_size(size/2, bgsym)
+        resto = round_size(size - metade, bgsym)
+        rtp = bg_place_tpsl(bgsym, hold_side, metade, tp1, "profit_plan")
+        rtr = bg_place_trailing(bgsym, is_long, resto, tp1, CALLBACK_RATIO)
+        ok_tp = rtp.get("code") == "00000"
+        ok_tr = rtr.get("code") == "00000"
+        extra = f"TP1 50% [{'ok' if ok_tp else 'FALHOU'}] + Trailing {CALLBACK_RATIO}% [{'ok' if ok_tr else 'FALHOU'}]"
+        if not ok_tp: avisos.append(f"⚠️ TP1 falhou: {rtp.get('msg','?')}")
+        if not ok_tr: avisos.append(f"⚠️ Trailing falhou: {rtr.get('msg','?')}")
+
+    m  = f"✅ <b>POSIÇÃO ABERTA!</b> (modo {modo})\n━━━━━━━━━━━━━━━\n"
+    m += f"{arrow} <b>{sym}/USDT — {direcao}</b>\n💲 Entrada: ~${fmt(price)}\n"
+    m += f"⚡ {lev}x | 💰 ${margem}\n📊 Size: {size}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n"
+    m += f"📋 {extra}\n━━━━━━━━━━━━━━━\n"
+    if avisos:
+        m += "\n".join(avisos) + "\n"
+    m += "⚠️ CONFIRMA na Bitget!"
+    send(m)
 
 # ==================== GRAFICO ====================
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
@@ -318,8 +376,11 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym):
     cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n🎯 TP2: ${fmt(tp2)}\n"
     cap += f"⚡ Alavancagem: {lev}x\n━━━━━━━━━━━━━━━\n"
     cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons)}\n━━━━━━━━━━━━━━━\n"
-    cap += f"💰 <b>ENTRAR?</b>\n✅ <b>sim VALOR</b> (ex: sim 5)\n❌ <b>não</b>\n"
-    cap += "⚠️ <i>Não é aconselhamento financeiro.</i>"
+    cap += f"💰 <b>ENTRAR?</b>\n"
+    cap += f"✅ <b>sim 5</b> → SL + TP1 fixo\n"
+    cap += f"✅ <b>sim 5 trail</b> → trailing {CALLBACK_RATIO}%\n"
+    cap += f"✅ <b>sim 5 hibrido</b> → 50% TP + 50% trailing\n"
+    cap += f"❌ <b>não</b>\n⚠️ <i>Não é aconselhamento financeiro.</i>"
     pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
     buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
     if buf: send_photo(buf, cap)
@@ -370,17 +431,21 @@ def process_replies():
             partes = text.replace("sim","").strip().split()
             try:
                 margem = float(partes[0].replace("$","").replace(",","."))
+                modo = "normal"
+                resto = " ".join(partes[1:])
+                if "trail" in resto: modo = "trail"
+                if "hib" in resto: modo = "hibrido"
                 sig, ohlc, e20, e50, bgsym = pending[CHAT_ID]
-                send(f"⏳ A processar ${margem}...")
-                executar_trade(sig, bgsym, margem)
+                send(f"⏳ A processar ${margem} (modo {modo})...")
+                executar_trade(sig, bgsym, margem, modo)
                 pending.pop(CHAT_ID, None)
             except Exception as e:
-                send(f"⚠️ Formato errado. Ex: <b>sim 5</b>")
+                send("⚠️ Formato errado. Ex: <b>sim 5</b> ou <b>sim 5 hibrido</b>")
 
 # ==================== LOOP ====================
 modo = "🔬 DRY RUN (teste)" if DRY_RUN else "💵 REAL"
 print(f"Bot iniciado! Modo: {modo}")
-send(f"🤖 <b>FuturesScan Bot</b>\nModo: <b>{modo}</b>\n⚡ Máx {MAX_LEV}x | 🛡️ SL+TP automático\n🧪 Testa já com: <b>/teste LTC</b>")
+send(f"🤖 <b>FuturesScan Bot</b>\nModo: <b>{modo}</b>\n⚡ Máx {MAX_LEV}x | Trailing {CALLBACK_RATIO}%\n🧪 Testa: <b>/teste LTC</b>")
 
 while True:
     process_replies()
