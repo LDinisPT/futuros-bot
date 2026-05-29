@@ -1,27 +1,19 @@
-import os
-import time
-import requests
-import io
-import hmac
-import hashlib
-import base64
-import json
+import os, time, requests, io, hmac, hashlib, base64, json
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# ==================== CONFIGURAÇÃO ====================
+# ==================== CONFIG ====================
 TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]
 BG_KEY = os.environ["BITGET_API_KEY"]
 BG_SECRET = os.environ["BITGET_SECRET"]
 BG_PASS = os.environ["BITGET_PASSPHRASE"]
-
 API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = False
+DRY_RUN = True   # <<< TESTE: True = simula sem dinheiro real. Mudar para False quando confirmado.
 
 pending = {}
 last_update_id = 0
@@ -29,15 +21,15 @@ last_analysis = 0
 
 def send(msg):
     try:
-        requests.post(f"{API}/sendMessage", json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML"}, timeout=10)
+        requests.post(f"{API}/sendMessage", json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
     except Exception as e:
         print(f"Erro telegram: {e}")
 
 def send_photo(buf, caption):
     try:
         buf.seek(0)
-        requests.post(f"{API}/sendPhoto", data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "HTML"},
-                      files={"photo": ("chart.png", buf, "image/png")}, timeout=20)
+        requests.post(f"{API}/sendPhoto", data={"chat_id":CHAT_ID,"caption":caption,"parse_mode":"HTML"},
+                      files={"photo":("chart.png",buf,"image/png")}, timeout=20)
     except Exception as e:
         print(f"Erro foto: {e}")
         send(caption)
@@ -45,7 +37,7 @@ def send_photo(buf, caption):
 def get_updates():
     global last_update_id
     try:
-        r = requests.get(f"{API}/getUpdates", params={"offset": last_update_id + 1, "timeout": 10}, timeout=15)
+        r = requests.get(f"{API}/getUpdates", params={"offset":last_update_id+1,"timeout":10}, timeout=15)
         return r.json().get("result", [])
     except:
         return []
@@ -55,15 +47,20 @@ def fmt(p):
     if p > 1: return f"{p:.4f}"
     return f"{p:.6f}"
 
-# ==================== BITGET HELPERS ====================
+# ==================== BITGET ====================
 def bg_sign(ts, method, path, body=""):
     msg = ts + method.upper() + path + body
     mac = hmac.new(BG_SECRET.encode(), msg.encode(), hashlib.sha256)
     return base64.b64encode(mac.digest()).decode()
 
-def bg_request(method, path, body_dict=None):
-    ts = str(int(time.time() * 1000))
-    body = json.dumps(body_dict) if body_dict else ""
+def bg_request(method, path, params=None):
+    ts = str(int(time.time()*1000))
+    if method == "GET" and params:
+        query = "&".join(f"{k}={v}" for k,v in params.items())
+        path = path + "?" + query
+        body = ""
+    else:
+        body = json.dumps(params) if params else ""
     sign = bg_sign(ts, method, path, body)
     headers = {
         "ACCESS-KEY": BG_KEY, "ACCESS-SIGN": sign, "ACCESS-PASSPHRASE": BG_PASS,
@@ -78,389 +75,293 @@ def bg_request(method, path, body_dict=None):
         return r.json()
     except Exception as e:
         print(f"Erro Bitget: {e}")
-        return {"code": "99999", "msg": str(e)}
+        return {"code":"99999","msg":str(e)}
 
-# ==================== PARES DINÂMICOS + PRECISÃO ====================
+# ==================== PARES + PRECISAO ====================
+ORIGINAL_PAIRS = [
+    ("XBTUSD","BTC","BTCUSDT"),("ETHUSD","ETH","ETHUSDT"),
+    ("SOLUSD","SOL","SOLUSDT"),("XRPUSD","XRP","XRPUSDT"),
+    ("ADAUSD","ADA","ADAUSDT"),("DOTUSDT","DOT","DOTUSDT"),
+    ("LINKUSD","LINK","LINKUSDT"),("UNIUSD","UNI","UNIUSDT"),
+    ("ATOMUSD","ATOM","ATOMUSDT"),("LTCUSD","LTC","LTCUSDT"),
+    ("XDGUSD","DOGE","DOGEUSDT"),("AAVEUSD","AAVE","AAVEUSDT")
+]
+
 def get_dynamic_pairs():
     try:
         url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
-        r = requests.get(url, timeout=15)
-        data = r.json()
+        data = requests.get(url, timeout=15).json()
         if data.get("code") != "00000" or not data.get("data"):
-            raise Exception("Resposta inválida")
-        contracts = data.get("data", [])
-        kraken_map = {
-            "BTCUSDT": ("XBTUSD", "BTC"), "ETHUSDT": ("ETHUSD", "ETH"),
-            "SOLUSDT": ("SOLUSD", "SOL"), "XRPUSDT": ("XRPUSD", "XRP"),
-            "ADAUSDT": ("ADAUSD", "ADA"), "DOTUSDT": ("DOTUSDT", "DOT"),
-            "LINKUSDT": ("LINKUSD", "LINK"), "UNIUSDT": ("UNIUSD", "UNI"),
-            "ATOMUSDT": ("ATOMUSD", "ATOM"), "LTCUSDT": ("LTCUSD", "LTC"),
-            "DOGEUSDT": ("XDGUSD", "DOGE"), "AAVEUSDT": ("AAVEUSD", "AAVE"),
-            "AVAXUSDT": ("AVAXUSD", "AVAX"), "NEARUSDT": ("NEARUSD", "NEAR"),
-            "TRXUSDT": ("TRXUSD", "TRX"), "BCHUSDT": ("BCHUSD", "BCH"),
-            "FILUSDT": ("FILUSD", "FIL"), "ETCUSDT": ("ETCUSD", "ETC"),
-            "SUIUSDT": ("SUIUSD", "SUI"), "TONUSDT": ("TONUSD", "TON"),
-            "INJUSDT": ("INJUSD", "INJ"),
-        }
-        dynamic_pairs = []
-        for c in contracts:
-            symbol = c.get("symbol")
-            if symbol in kraken_map:
-                kraken_pair, display_sym = kraken_map[symbol]
-                dynamic_pairs.append((kraken_pair, display_sym, symbol))
-        print(f"✅ Carregados {len(dynamic_pairs)} pares dinâmicos da Bitget")
-        return dynamic_pairs
+            raise Exception("resposta invalida")
+        valid = {c.get("symbol") for c in data["data"]}
+        pairs = [p for p in ORIGINAL_PAIRS if p[2] in valid]
+        print(f"✅ {len(pairs)} pares validos na Bitget")
+        return pairs if pairs else ORIGINAL_PAIRS
     except Exception as e:
-        print(f"⚠️ Erro ao buscar pares: {e} - usando fallback")
+        print(f"⚠️ Erro pares: {e} - usando fallback")
         return ORIGINAL_PAIRS
-
-ORIGINAL_PAIRS = [
-    ("XBTUSD", "BTC", "BTCUSDT"), ("ETHUSD", "ETH", "ETHUSDT"),
-    ("SOLUSD", "SOL", "SOLUSDT"), ("XRPUSD", "XRP", "XRPUSDT"),
-    ("ADAUSD", "ADA", "ADAUSDT"), ("DOTUSDT", "DOT", "DOTUSDT"),
-    ("LINKUSD", "LINK", "LINKUSDT"), ("UNIUSD", "UNI", "UNIUSDT"),
-    ("ATOMUSD", "ATOM", "ATOMUSDT"), ("LTCUSD", "LTC", "LTCUSDT"),
-    ("XDGUSD", "DOGE", "DOGEUSDT"), ("AAVEUSD", "AAVE", "AAVEUSDT")
-]
 
 PAIRS = get_dynamic_pairs()
 
 contract_precision = {}
-def get_contract_precision(bgsym):
+def get_precision(bgsym):
     if bgsym in contract_precision:
         return contract_precision[bgsym]
     try:
         url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol={bgsym}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
+        data = requests.get(url, timeout=10).json()
         if data.get("code") == "00000" and data.get("data"):
-            vol_place = int(data["data"][0].get("volumePlace", 4))
-            price_place = int(data["data"][0].get("pricePlace", 4))
-            contract_precision[bgsym] = (vol_place, price_place)
-            return vol_place, price_place
+            vp = int(data["data"][0].get("volumePlace", 4))
+            pp = int(data["data"][0].get("pricePlace", 4))
+            contract_precision[bgsym] = (vp, pp)
+            return vp, pp
     except:
         pass
     return 4, 4
 
 def calc_size(notional, price, bgsym):
-    vol_place, _ = get_contract_precision(bgsym)
+    vp, _ = get_precision(bgsym)
     s = notional / price
-    multiplier = 10 ** vol_place
-    size = round(s * multiplier) / multiplier
+    m = 10 ** vp
+    size = round(s * m) / m
     size = max(size, 0.001)
-    print(f"DEBUG SIZE - {bgsym} | Notional: ${notional:.2f} | Price: ${price:.4f} | Size: {size}")
+    print(f"SIZE {bgsym}: notional=${notional:.2f} price=${price:.4f} size={size}")
     return size
 
 def round_price(price, bgsym):
-    _, price_place = get_contract_precision(bgsym)
-    multiplier = 10 ** price_place
-    rounded = round(price * multiplier) / multiplier
-    print(f"DEBUG PRICE - {bgsym} | Original: ${price:.6f} | Rounded: ${rounded:.6f}")
-    return rounded
+    _, pp = get_precision(bgsym)
+    m = 10 ** pp
+    return round(price * m) / m
 
 # ==================== TRADING ====================
 def check_open_position(symbol):
-    resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
-    if resp.get("code") != "00000": return False
+    resp = bg_request("GET", "/api/v2/mix/position/all-position",
+                      {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    if resp.get("code") != "00000":
+        print(f"check_pos erro: {resp.get('msg')}")
+        return False
     for pos in resp.get("data", []):
-        if pos.get("symbol") == symbol and float(pos.get("total", 0)) > 0:
+        if pos.get("symbol") == symbol and float(pos.get("total",0)) > 0:
             return True
     return False
 
-def get_funding_rate(bgsym):
-    resp = bg_request("GET", "/api/v2/mix/market/current-fund-rate", {"symbol": bgsym, "productType": "USDT-FUTURES"})
-    if resp.get("code") == "00000" and resp.get("data"):
-        return float(resp["data"][0]["fundingRate"]) * 100
-    return 0.0
-
 def bg_set_leverage(symbol, lev):
     return bg_request("POST", "/api/v2/mix/account/set-leverage", {
-        "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT", "leverage": str(lev)
+        "symbol":symbol, "productType":"USDT-FUTURES", "marginCoin":"USDT", "leverage":str(lev)
     })
 
-def bg_place_market_order(symbol, is_long, size):
+def bg_place_order(symbol, is_long, size, sl, tp):
     side = "buy" if is_long else "sell"
     return bg_request("POST", "/api/v2/mix/order/place-order", {
-        "symbol": symbol,
-        "productType": "USDT-FUTURES",
-        "marginMode": "isolated",
-        "marginCoin": "USDT",
-        "size": str(size),
-        "side": side,
-        "orderType": "market"
-    })
-
-def bg_place_stop_order(symbol, is_long, size, trigger_price, stop_type):
-    # stop_type: 1 = Take Profit, 2 = Stop Loss
-    side = "sell" if is_long else "buy"   # stop é na direção oposta à posição
-    print(f"DEBUG STOP ORDER - {symbol} | Type: {'TP' if stop_type == '1' else 'SL'} | Trigger: ${trigger_price:.6f} | Side: {side}")
-    return bg_request("POST", "/api/v2/mix/order/place-order", {
-        "symbol": symbol,
-        "productType": "USDT-FUTURES",
-        "marginMode": "isolated",
-        "marginCoin": "USDT",
-        "size": str(size),
-        "side": side,
-        "orderType": "stop",
-        "triggerPrice": str(trigger_price),
-        "triggerType": "mark_price",
-        "stopSurplusOrLoss": stop_type
+        "symbol":symbol, "productType":"USDT-FUTURES", "marginMode":"isolated",
+        "marginCoin":"USDT", "size":str(size), "side":side, "orderType":"market",
+        "presetStopSurplusPrice":str(tp), "presetStopLossPrice":str(sl)
     })
 
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
-    sl_mult = 1.8; tp1_mult = 2.8; tp2_mult = 5.0
+    sl_m, tp1_m, tp2_m = 1.8, 2.8, 5.0
     if "LONG" in signal:
-        return price - atr_val*sl_mult, price + atr_val*tp1_mult, price + atr_val*tp2_mult, 3
-    else:
-        return price + atr_val*sl_mult, price - atr_val*tp1_mult, price - atr_val*tp2_mult, 3
+        return price - atr_val*sl_m, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
+    return price + atr_val*sl_m, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
 
 def executar_trade(sig, bgsym, margem):
-    if DRY_RUN:
-        send("🔬 <b>DRY RUN ATIVADO (v3.6)</b>")
-        return
     sym, price, _, rsi_v, label, score, reasons, atr_val = sig
-    if check_open_position(bgsym):
-        send(f"⚠️ Já existe posição aberta em <b>{sym}</b>.")
-        return
     is_long = "LONG" in label
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
+    sl = round_price(sl, bgsym)
+    tp1 = round_price(tp1, bgsym)
     lev = min(alav, MAX_LEV)
     notional = margem * lev
     size = calc_size(notional, price, bgsym)
+    direcao = "LONG" if is_long else "SHORT"
 
-    # 1. Definir alavancagem
-    r1 = bg_set_leverage(bgsym, lev)
-
-    # 2. Abrir ordem de mercado
-    r2 = bg_place_market_order(bgsym, is_long, size)
-
-    if r2.get("code") == "00000":
-        arrow = "↑" if is_long else "↓"
-        m = f"✅ <b>POSIÇÃO ABERTA v3.6!</b>\n━━━━━━━━━━━━━━━\n"
-        m += f"{arrow} <b>{sym}/USDT — {'LONG' if is_long else 'SHORT'}</b>\n"
-        m += f"💲 Entrada: ~${fmt(price)}\n"
-        m += f"⚡ Alavancagem: {lev}x\n"
-        m += f"💰 Margem: ${margem}\n"
-        m += f"📊 Tamanho: {size}\n"
-        m += f"🛑 SL: ${fmt(sl)} (ATR)\n"
-        m += f"🎯 TP1: ${fmt(tp1)}\n"
-        m += f"━━━━━━━━━━━━━━━\n"
-        m += f"✅ SL e TP1 colocados automaticamente com ordens separadas\nVerifique na Bitget!"
+    if DRY_RUN:
+        m  = f"🔬 <b>DRY RUN (simulação)</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"{'↑' if is_long else '↓'} {sym}/USDT — {direcao}\n"
+        m += f"💲 Entrada: ~${fmt(price)}\n⚡ {lev}x | 💰 ${margem}\n"
+        m += f"📊 Size: {size}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n"
+        m += f"━━━━━━━━━━━━━━━\n✅ Se fosse real, abria isto.\n"
+        m += f"<i>(DRY_RUN ativo — nada foi executado)</i>"
         send(m)
+        return
 
-        # 3. Colocar SL e TP separadamente (método mais confiável)
-        bg_place_stop_order(bgsym, is_long, size, sl, "2")   # Stop Loss
-        bg_place_stop_order(bgsym, is_long, size, tp1, "1")  # Take Profit
+    if check_open_position(bgsym):
+        send(f"⚠️ Já tens posição aberta em <b>{sym}</b>. Não abri outra.")
+        return
+
+    bg_set_leverage(bgsym, lev)
+    r2 = bg_place_order(bgsym, is_long, size, sl, tp1)
+    if r2.get("code") == "00000":
+        m  = f"✅ <b>POSIÇÃO ABERTA!</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"{'↑' if is_long else '↓'} <b>{sym}/USDT — {direcao}</b>\n"
+        m += f"💲 Entrada: ~${fmt(price)}\n⚡ {lev}x | 💰 ${margem}\n"
+        m += f"📊 Size: {size}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n"
+        m += f"━━━━━━━━━━━━━━━\n✅ SL e TP1 incluídos na ordem.\n"
+        m += f"⚠️ CONFIRMA na Bitget que o SL aparece!"
+        send(m)
     else:
-        send(f"❌ Erro ao abrir: {r2.get('msg','?')}")
+        send(f"❌ Erro ao abrir: {r2.get('msg','?')} (cod {r2.get('code','?')})")
 
-# ==================== GRÁFICO ====================
+# ==================== GRAFICO ====================
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
     try:
         candles = ohlc[-50:]
-        opens = [float(c[1]) for c in candles]
-        highs = [float(c[2]) for c in candles]
-        lows = [float(c[3]) for c in candles]
-        closes = [float(c[4]) for c in candles]
-        xs = list(range(len(candles)))
-        fig, ax = plt.subplots(figsize=(10, 5))
-        fig.patch.set_facecolor('#0d1318')
-        ax.set_facecolor('#0d1318')
-        for i, x in enumerate(xs):
-            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
-            color = '#00e676' if c >= o else '#ff3d5a'
-            ax.plot([x, x], [l, h], color=color, linewidth=0.8)
-            ax.add_patch(plt.Rectangle((x - 0.3, min(o, c)), 0.6, abs(c - o), color=color, zorder=3))
-        ax.plot(xs, ema20[-50:], color='#4a9eff', linewidth=1.2, label='EMA20')
-        ax.plot(xs, ema50[-50:], color='#ffd166', linewidth=1.2, label='EMA50')
-        ax.axhline(price, color='#ffffff', linewidth=1.2, linestyle='--', label=f'Entrada ${fmt(price)}')
-        ax.axhline(sl, color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
-        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
-        ax.axhline(tp2, color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
-        ax.tick_params(colors='#4a6070', labelsize=7)
+        opens=[float(c[1]) for c in candles]; highs=[float(c[2]) for c in candles]
+        lows=[float(c[3]) for c in candles]; closes=[float(c[4]) for c in candles]
+        xs=list(range(len(candles)))
+        fig, ax = plt.subplots(figsize=(10,5))
+        fig.patch.set_facecolor('#0d1318'); ax.set_facecolor('#0d1318')
+        for i,x in enumerate(xs):
+            o,h,l,c=opens[i],highs[i],lows[i],closes[i]
+            col='#00e676' if c>=o else '#ff3d5a'
+            ax.plot([x,x],[l,h],color=col,linewidth=0.8)
+            ax.add_patch(plt.Rectangle((x-0.3,min(o,c)),0.6,abs(c-o),color=col,zorder=3))
+        ax.plot(xs,ema20[-50:],color='#4a9eff',linewidth=1.2,label='EMA20')
+        ax.plot(xs,ema50[-50:],color='#ffd166',linewidth=1.2,label='EMA50')
+        ax.axhline(price,color='#ffffff',linewidth=1.2,linestyle='--',label=f'Entrada ${fmt(price)}')
+        ax.axhline(sl,color='#ff3d5a',linewidth=1.2,linestyle='--',label=f'SL ${fmt(sl)}')
+        ax.axhline(tp1,color='#00e676',linewidth=1.0,linestyle=':',label=f'TP1 ${fmt(tp1)}')
+        ax.axhline(tp2,color='#00e676',linewidth=1.2,linestyle='--',label=f'TP2 ${fmt(tp2)}')
+        ax.tick_params(colors='#4a6070',labelsize=7)
         for sp in ax.spines.values(): sp.set_color('#1a2430')
         ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
         ax.xaxis.set_tick_params(labelbottom=False)
-        ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
-        d = "LONG" if "LONG" in signal else "SHORT"
-        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.6', color='#c8d8e8', fontsize=10, pad=10)
-        ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
+        ax.grid(color='#1a2430',linewidth=0.5,alpha=0.5)
+        d="LONG" if "LONG" in signal else "SHORT"
+        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h)',color='#c8d8e8',fontsize=10,pad=10)
+        ax.legend(loc='upper left',fontsize=7,facecolor='#0d1318',edgecolor='#1a2430',labelcolor='#c8d8e8')
         plt.tight_layout()
-        buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=120, facecolor='#0d1318')
-        plt.close()
+        buf=io.BytesIO(); plt.savefig(buf,format='png',dpi=120,facecolor='#0d1318'); plt.close()
         return buf
     except Exception as e:
-        print(f"Erro gráfico: {e}")
+        print(f"Erro grafico: {e}")
         return None
 
 # ==================== INDICADORES ====================
-def ema_arr(closes, period):
-    if len(closes) < period:
-        return [closes[-1]] * len(closes)
-    k = 2 / (period + 1)
-    ema = sum(closes[:period]) / period
-    result = list(closes[:period])
-    for price in closes[period:]:
-        ema = price * k + ema * (1 - k)
-        result.append(ema)
-    return result
+def ema_arr(c, p):
+    if len(c)<p: return [c[-1]]*len(c)
+    k=2/(p+1); e=sum(c[:p])/p; r=list(c[:p])
+    for x in c[p:]:
+        e=x*k+e*(1-k); r.append(e)
+    return r
 
-def macd(closes, fast=12, slow=26, signal=9):
-    if len(closes) < slow: return 0, 0, 0
-    ema_fast = ema_arr(closes, fast)
-    ema_slow = ema_arr(closes, slow)
-    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-    signal_line = ema_arr(macd_line, signal)
-    histogram = macd_line[-1] - signal_line[-1]
-    return macd_line[-1], signal_line[-1], histogram
+def macd(c, fast=12, slow=26, sig=9):
+    if len(c)<slow: return 0,0,0
+    ef=ema_arr(c,fast); es=ema_arr(c,slow)
+    ml=[f-s for f,s in zip(ef,es)]
+    sl=ema_arr(ml,sig)
+    return ml[-1], sl[-1], ml[-1]-sl[-1]
 
-def atr(highs, lows, closes, period=14):
-    if len(highs) < period + 1: return 0.0
-    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(1, len(highs))]
-    atr_val = sum(trs[:period]) / period
-    for i in range(period, len(trs)):
-        atr_val = (atr_val * (period - 1) + trs[i]) / period
-    return atr_val
+def atr(h, l, c, p=14):
+    if len(h)<p+1: return 0.0
+    trs=[max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(h))]
+    a=sum(trs[:p])/p
+    for i in range(p,len(trs)):
+        a=(a*(p-1)+trs[i])/p
+    return a
 
-def rsi(closes, period=14):
-    if len(closes) < period + 1: return 50.0
-    gains = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
-    losses = [abs(min(closes[i] - closes[i-1], 0)) for i in range(1, len(closes))]
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
+def rsi(c, p=14):
+    if len(c)<p+1: return 50.0
+    g=[max(c[i]-c[i-1],0) for i in range(1,len(c))]
+    l=[abs(min(c[i]-c[i-1],0)) for i in range(1,len(c))]
+    ag=sum(g[:p])/p; al=sum(l[:p])/p
+    for i in range(p,len(g)):
+        ag=(ag*(p-1)+g[i])/p; al=(al*(p-1)+l[i])/p
+    if al==0: return 100.0
+    return round(100-(100/(1+ag/al)),1)
 
-# ==================== ANÁLISE ====================
+# ==================== ANALISE ====================
 def analyze():
     global last_analysis
-    last_analysis = time.time()
-    signals = []
-    for pair, sym, bgsym in PAIRS:
+    last_analysis=time.time()
+    signals=[]
+    for pair,sym,bgsym in PAIRS:
         try:
-            ohlc_data = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": 60}, timeout=15).json()
-            ohlc = ohlc_data["result"][list(ohlc_data["result"].keys())[0]]
-            closes = [float(c[4]) for c in ohlc]
-            highs = [float(c[2]) for c in ohlc]
-            lows = [float(c[3]) for c in ohlc]
-            ticker_data = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair}, timeout=10).json()
-            t = ticker_data["result"][list(ticker_data["result"].keys())[0]]
-            price = float(t["c"][0])
-            op = float(t["o"])
-            change = round((price - op) / op * 100, 2)
-
-            r = rsi(closes)
-            e20 = ema_arr(closes, 20)
-            e50 = ema_arr(closes, 50)
-            bull = e20[-1] > e50[-1]
-            macd_line, signal_line, hist = macd(closes)
-            atr_val = atr(highs, lows, closes)
-            funding = get_funding_rate(bgsym)
-
-            score = 0
-            reasons = []
-
-            if r < 30: score += 3; reasons.append("RSI sobrevendido")
-            elif r < 40: score += 1; reasons.append("RSI baixo")
-            elif r > 70: score -= 3; reasons.append("RSI sobrecomprado")
-            elif r > 60: score -= 1; reasons.append("RSI alto")
-
-            if bull: score += 2; reasons.append("EMA bullish")
-            else: score -= 2; reasons.append("EMA bearish")
-            if price > e20[-1] and bull: score += 1
-            elif price < e20[-1] and not bull: score -= 1
-
-            if macd_line > signal_line and hist > 0:
-                score += 2; reasons.append("MACD bullish")
-            elif macd_line < signal_line and hist < 0:
-                score -= 2; reasons.append("MACD bearish")
-
-            if funding > 0.01 and bull:
-                score -= 1; reasons.append(f"Funding alto ({funding:.3f}%)")
-            elif funding < -0.01 and not bull:
-                score -= 1; reasons.append(f"Funding baixo ({funding:.3f}%)")
-
-            if score >= 4:
-                label = "🟢 LONG FORTE"
-                signals.append(((sym, price, change, r, label, score, reasons, atr_val), ohlc, e20, e50, bgsym))
-            elif score <= -4:
-                label = "🔴 SHORT FORTE"
-                signals.append(((sym, price, change, r, label, score, reasons, atr_val), ohlc, e20, e50, bgsym))
-
-            print(f"{sym}: RSI={r} MACD={hist:+.4f} ATR={atr_val:.6f} Funding={funding:.3f}% score={score}")
+            od=requests.get("https://api.kraken.com/0/public/OHLC",params={"pair":pair,"interval":60},timeout=15).json()
+            ohlc=od["result"][list(od["result"].keys())[0]]
+            closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
+            td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
+            t=td["result"][list(td["result"].keys())[0]]
+            price=float(t["c"][0]); op=float(t["o"]); change=round((price-op)/op*100,2)
+            r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
+            bull=e20[-1]>e50[-1]
+            ml,sl_,hist=macd(closes); atr_val=atr(highs,lows,closes)
+            score=0; reasons=[]
+            if r<30: score+=3; reasons.append("RSI sobrevendido")
+            elif r<40: score+=1; reasons.append("RSI baixo")
+            elif r>70: score-=3; reasons.append("RSI sobrecomprado")
+            elif r>60: score-=1; reasons.append("RSI alto")
+            if bull: score+=2; reasons.append("EMA bullish")
+            else: score-=2; reasons.append("EMA bearish")
+            if price>e20[-1] and bull: score+=1
+            elif price<e20[-1] and not bull: score-=1
+            if ml>sl_ and hist>0: score+=2; reasons.append("MACD bullish")
+            elif ml<sl_ and hist<0: score-=2; reasons.append("MACD bearish")
+            if score>=4:
+                signals.append(((sym,price,change,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
+            elif score<=-4:
+                signals.append(((sym,price,change,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
+            print(f"{sym}: RSI={r} MACD={hist:+.4f} score={score}")
             time.sleep(0.6)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
 
 def enviar_sinal(sig, ohlc, e20, e50, bgsym):
-    sym, price, change, rsi_v, label, score, reasons, atr_val = sig
-    sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
+    sym,price,change,rsi_v,label,score,reasons,atr_val = sig
+    sl,tp1,tp2,alav = calc_levels(price,label,atr_val)
     lev = min(alav, MAX_LEV)
     arrow = "↑" if "LONG" in label else "↓"
-    cap = f"{arrow} <b>{sym}/USD — {label} v3.6</b>\n━━━━━━━━━━━━━━━\n"
-    cap += f"💲 Entrada: ${fmt(price)}\n"
-    cap += f"🛑 SL: ${fmt(sl)} (ATR)\n"
-    cap += f"🎯 TP1: ${fmt(tp1)}\n"
-    cap += f"🎯 TP2: ${fmt(tp2)}\n"
-    cap += f"⚡ Alavancagem: {lev}x\n"
-    cap += "━━━━━━━━━━━━━━━\n"
-    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}/9\n"
-    cap += f"📌 {', '.join(reasons)}\n"
-    cap += "━━━━━━━━━━━━━━━\n"
-    cap += "💰 <b>ENTRAR?</b>\n✅ Responde: <b>sim VALOR</b> (ex: sim 5)\n❌ Ou: <b>não</b>\n"
+    modo = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
+    cap  = f"{arrow} <b>{sym}/USD — {label}</b> ({modo})\n━━━━━━━━━━━━━━━\n"
+    cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)}\n🎯 TP1: ${fmt(tp1)}\n🎯 TP2: ${fmt(tp2)}\n"
+    cap += f"⚡ Alavancagem: {lev}x\n━━━━━━━━━━━━━━━\n"
+    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons)}\n━━━━━━━━━━━━━━━\n"
+    cap += f"💰 <b>ENTRAR?</b>\n✅ <b>sim VALOR</b> (ex: sim 5)\n❌ <b>não</b>\n"
     cap += "⚠️ <i>Não é aconselhamento financeiro.</i>"
     pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
     buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
-    if buf:
-        send_photo(buf, cap)
-    else:
-        send(cap)
+    if buf: send_photo(buf, cap)
+    else: send(cap)
 
 def process_replies():
     global last_update_id
     for u in get_updates():
         last_update_id = u["update_id"]
-        text = u.get("message", {}).get("text", "").strip().lower()
+        text = u.get("message",{}).get("text","").strip().lower()
         if not text or text.startswith("/"): continue
         if CHAT_ID not in pending: continue
-        if text in ("não", "nao", "n", "no"):
+        if text in ("não","nao","n","no"):
             send("❌ Sinal cancelado.")
             pending.pop(CHAT_ID, None)
             continue
-        if text.startswith(("sim", "s ")):
-            partes = text.replace("sim", "").replace("s", "").strip().split()
+        if text.startswith("sim") or text.startswith("s "):
+            partes = text.replace("sim","").strip().split()
             try:
-                margem = float(partes[0].replace("$", "").replace(",", "."))
+                margem = float(partes[0].replace("$","").replace(",","."))
                 sig, ohlc, e20, e50, bgsym = pending[CHAT_ID]
-                send(f"⏳ A abrir posição com ${margem}...")
+                send(f"⏳ A processar ${margem}...")
                 executar_trade(sig, bgsym, margem)
                 pending.pop(CHAT_ID, None)
             except Exception as e:
                 send(f"⚠️ Formato errado. Ex: <b>sim 5</b>")
 
-# ==================== LOOP PRINCIPAL ====================
-print("🤖 Bot iniciado! (versão v3.6 — SL/TP com ordens separadas)")
-send("🤖 <b>FuturesScan Bot v3.6</b>\n✅ SL e TP agora colocados com ordens separadas\nTenta com sim 5")
+# ==================== LOOP ====================
+modo = "🔬 DRY RUN (teste)" if DRY_RUN else "💵 REAL"
+print(f"Bot iniciado! Modo: {modo}")
+send(f"🤖 <b>FuturesScan Bot</b>\nModo: <b>{modo}</b>\n⚡ Máx {MAX_LEV}x | 🛡️ SL+TP automático\nQuando houver sinal, pergunto se entras.")
 
 while True:
     process_replies()
-    if time.time() - last_analysis >= 3600:
-        print("A analisar mercado (v3.6)...")
+    if time.time()-last_analysis >= 3600:
+        print("A analisar mercado...")
         try:
             signals = analyze()
             for item in signals:
-                sig, ohlc, e20, e50, bgsym = item
-                enviar_sinal(sig, ohlc, e20, e50, bgsym)
+                enviar_sinal(*item)
                 break
-            if not signals:
-                print("Sem sinais fortes esta hora.")
+            if not signals: print("Sem sinais fortes.")
         except Exception as e:
             print(f"Erro geral: {e}")
     time.sleep(3)
