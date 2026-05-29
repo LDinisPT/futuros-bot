@@ -22,6 +22,7 @@ BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
 DRY_RUN = False
+TRAILING_CALLBACK = 1.0   # % de Trailing Stop (podes alterar aqui)
 
 pending = {}
 last_update_id = 0
@@ -191,9 +192,8 @@ def bg_place_market_order(symbol, is_long, size):
     })
 
 def bg_place_stop_order(symbol, is_long, size, trigger_price, stop_type):
-    # stop_type: 1 = Take Profit, 2 = Stop Loss
-    side = "sell" if is_long else "buy"   # stop é na direção oposta à posição
-    print(f"DEBUG STOP ORDER - {symbol} | Type: {'TP' if stop_type == '1' else 'SL'} | Trigger: ${trigger_price:.6f} | Side: {side}")
+    side = "sell" if is_long else "buy"
+    print(f"DEBUG STOP ORDER - {symbol} | Type: {'TP' if stop_type == '1' else 'SL'} | Trigger: ${trigger_price:.6f}")
     return bg_request("POST", "/api/v2/mix/order/place-order", {
         "symbol": symbol,
         "productType": "USDT-FUTURES",
@@ -207,51 +207,66 @@ def bg_place_stop_order(symbol, is_long, size, trigger_price, stop_type):
         "stopSurplusOrLoss": stop_type
     })
 
+def bg_place_trailing_stop(symbol, is_long, size, callback_ratio=TRAILING_CALLBACK):
+    side = "sell" if is_long else "buy"
+    print(f"DEBUG TRAILING STOP - {symbol} | Callback: {callback_ratio}% | Side: {side}")
+    return bg_request("POST", "/api/v2/mix/order/place-plan-order", {
+        "planType": "track_plan",
+        "symbol": symbol,
+        "productType": "USDT-FUTURES",
+        "marginMode": "isolated",
+        "marginCoin": "USDT",
+        "size": str(size),
+        "side": side,
+        "triggerPrice": "0",
+        "triggerType": "mark_price",
+        "callbackRatio": str(callback_ratio)
+    })
+
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
-    sl_mult = 1.8; tp1_mult = 2.8; tp2_mult = 5.0
+    sl_mult = 1.8; tp1_mult = 2.8
     if "LONG" in signal:
-        return price - atr_val*sl_mult, price + atr_val*tp1_mult, price + atr_val*tp2_mult, 3
+        return price - atr_val*sl_mult, price + atr_val*tp1_mult, 3
     else:
-        return price + atr_val*sl_mult, price - atr_val*tp1_mult, price - atr_val*tp2_mult, 3
+        return price + atr_val*sl_mult, price - atr_val*tp1_mult, 3
 
 def executar_trade(sig, bgsym, margem):
     if DRY_RUN:
-        send("🔬 <b>DRY RUN ATIVADO (v3.6)</b>")
+        send("🔬 <b>DRY RUN ATIVADO (v3.7)</b>")
         return
     sym, price, _, rsi_v, label, score, reasons, atr_val = sig
     if check_open_position(bgsym):
         send(f"⚠️ Já existe posição aberta em <b>{sym}</b>.")
         return
     is_long = "LONG" in label
-    sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
+    sl, tp1, alav = calc_levels(price, label, atr_val)
     lev = min(alav, MAX_LEV)
     notional = margem * lev
     size = calc_size(notional, price, bgsym)
 
-    # 1. Definir alavancagem
     r1 = bg_set_leverage(bgsym, lev)
-
-    # 2. Abrir ordem de mercado
     r2 = bg_place_market_order(bgsym, is_long, size)
 
     if r2.get("code") == "00000":
         arrow = "↑" if is_long else "↓"
-        m = f"✅ <b>POSIÇÃO ABERTA v3.6!</b>\n━━━━━━━━━━━━━━━\n"
+        m = f"✅ <b>POSIÇÃO ABERTA v3.7!</b>\n━━━━━━━━━━━━━━━\n"
         m += f"{arrow} <b>{sym}/USDT — {'LONG' if is_long else 'SHORT'}</b>\n"
         m += f"💲 Entrada: ~${fmt(price)}\n"
         m += f"⚡ Alavancagem: {lev}x\n"
         m += f"💰 Margem: ${margem}\n"
         m += f"📊 Tamanho: {size}\n"
-        m += f"🛑 SL: ${fmt(sl)} (ATR)\n"
+        m += f"🛑 SL fixo: ${fmt(sl)}\n"
         m += f"🎯 TP1: ${fmt(tp1)}\n"
-        m += f"━━━━━━━━━━━━━━━\n"
-        m += f"✅ SL e TP1 colocados automaticamente com ordens separadas\nVerifique na Bitget!"
+        m += f"🔄 Trailing Stop: {TRAILING_CALLBACK}% automático\n"
+        m += f"━━━━━━━━━━━━━━━\n✅ Tudo configurado automaticamente!"
         send(m)
 
-        # 3. Colocar SL e TP separadamente (método mais confiável)
-        bg_place_stop_order(bgsym, is_long, size, sl, "2")   # Stop Loss
-        bg_place_stop_order(bgsym, is_long, size, tp1, "1")  # Take Profit
+        # Ordens fixas
+        bg_place_stop_order(bgsym, is_long, size, sl, "2")
+        bg_place_stop_order(bgsym, is_long, size, tp1, "1")
+        # Trailing Stop automático
+        bg_place_trailing_stop(bgsym, is_long, size)
     else:
         send(f"❌ Erro ao abrir: {r2.get('msg','?')}")
 
@@ -284,7 +299,7 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         ax.xaxis.set_tick_params(labelbottom=False)
         ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
         d = "LONG" if "LONG" in signal else "SHORT"
-        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.6', color='#c8d8e8', fontsize=10, pad=10)
+        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.7', color='#c8d8e8', fontsize=10, pad=10)
         ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
         plt.tight_layout()
         buf = io.BytesIO()
@@ -401,14 +416,14 @@ def analyze():
 
 def enviar_sinal(sig, ohlc, e20, e50, bgsym):
     sym, price, change, rsi_v, label, score, reasons, atr_val = sig
-    sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
+    sl, tp1, tp2, alav = calc_levels(price, label, atr_val) if "tp2" in locals() else calc_levels(price, label, atr_val) + (price * 5,)
     lev = min(alav, MAX_LEV)
     arrow = "↑" if "LONG" in label else "↓"
-    cap = f"{arrow} <b>{sym}/USD — {label} v3.6</b>\n━━━━━━━━━━━━━━━\n"
+    cap = f"{arrow} <b>{sym}/USD — {label} v3.7</b>\n━━━━━━━━━━━━━━━\n"
     cap += f"💲 Entrada: ${fmt(price)}\n"
     cap += f"🛑 SL: ${fmt(sl)} (ATR)\n"
     cap += f"🎯 TP1: ${fmt(tp1)}\n"
-    cap += f"🎯 TP2: ${fmt(tp2)}\n"
+    cap += f"🔄 Trailing Stop: {TRAILING_CALLBACK}% automático\n"
     cap += f"⚡ Alavancagem: {lev}x\n"
     cap += "━━━━━━━━━━━━━━━\n"
     cap += f"📉 RSI: {rsi_v} | Score: {score:+d}/9\n"
@@ -417,7 +432,7 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym):
     cap += "💰 <b>ENTRAR?</b>\n✅ Responde: <b>sim VALOR</b> (ex: sim 5)\n❌ Ou: <b>não</b>\n"
     cap += "⚠️ <i>Não é aconselhamento financeiro.</i>"
     pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
-    buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
+    buf = make_chart(ohlc, price, sl, tp1, tp1 * 1.2, sym, label, e20, e50)  # tp2 aproximado
     if buf:
         send_photo(buf, cap)
     else:
@@ -446,13 +461,13 @@ def process_replies():
                 send(f"⚠️ Formato errado. Ex: <b>sim 5</b>")
 
 # ==================== LOOP PRINCIPAL ====================
-print("🤖 Bot iniciado! (versão v3.6 — SL/TP com ordens separadas)")
-send("🤖 <b>FuturesScan Bot v3.6</b>\n✅ SL e TP agora colocados com ordens separadas\nTenta com sim 5")
+print("🤖 Bot iniciado! (versão v3.7 — Trailing Stop automático)")
+send("🤖 <b>FuturesScan Bot v3.7</b>\n✅ Trailing Stop de 1% ativado automaticamente\nTesta com sim 5")
 
 while True:
     process_replies()
     if time.time() - last_analysis >= 3600:
-        print("A analisar mercado (v3.6)...")
+        print("A analisar mercado (v3.7)...")
         try:
             signals = analyze()
             for item in signals:
