@@ -21,7 +21,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = False   # ← Muda para True se quiseres testar sem abrir ordens reais
+DRY_RUN = False   # Muda para True se quiseres testar sem abrir ordens
 
 pending = {}
 last_update_id = 0
@@ -146,11 +146,11 @@ def calc_size(notional, price, bgsym):
     s = notional / price
     multiplier = 10 ** precision
     size = round(s * multiplier) / multiplier
-    size = max(size, 0.001)   # mínimo seguro
-    print(f"DEBUG - {bgsym} | Notional: ${notional} | Price: ${price} | Size calculado: {size}")
+    size = max(size, 0.001)   # mínimo seguro para evitar erro
+    print(f"DEBUG SIZE - {bgsym} | Notional: ${notional:.2f} | Price: ${price:.4f} | Size: {size}")
     return size
 
-# ==================== RESTO DO CÓDIGO (funcional) ====================
+# ==================== RESTO DO CÓDIGO ====================
 def check_open_position(symbol):
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
     if resp.get("code") != "00000": return False
