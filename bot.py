@@ -214,7 +214,7 @@ def executar_trade(sig, bgsym, margem):
     else:
         send(f"❌ Erro ao abrir: {r2.get('msg','?')}")
 
-# ==================== GRÁFICO ====================
+# ==================== GRÁFICO (corrigido) ====================
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
     try:
         candles = ohlc[-50:]
@@ -235,4 +235,191 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         ax.plot(xs, ema50[-50:], color='#ffd166', linewidth=1.2, label='EMA50')
         ax.axhline(price, color='#ffffff', linewidth=1.2, linestyle='--', label=f'Entrada ${fmt(price)}')
         ax.axhline(sl, color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
-        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle
+        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
+        ax.axhline(tp2, color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
+        ax.tick_params(colors='#4a6070', labelsize=7)
+        for sp in ax.spines.values(): sp.set_color('#1a2430')
+        ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
+        ax.xaxis.set_tick_params(labelbottom=False)
+        ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
+        d = "LONG" if "LONG" in signal else "SHORT"
+        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.3', color='#c8d8e8', fontsize=10, pad=10)
+        ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120, facecolor='#0d1318')
+        plt.close()
+        return buf
+    except Exception as e:
+        print(f"Erro gráfico: {e}")
+        return None
+
+# ==================== INDICADORES ====================
+def ema_arr(closes, period):
+    if len(closes) < period:
+        return [closes[-1]] * len(closes)
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    result = list(closes[:period])
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+        result.append(ema)
+    return result
+
+def macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow: return 0, 0, 0
+    ema_fast = ema_arr(closes, fast)
+    ema_slow = ema_arr(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema_arr(macd_line, signal)
+    histogram = macd_line[-1] - signal_line[-1]
+    return macd_line[-1], signal_line[-1], histogram
+
+def atr(highs, lows, closes, period=14):
+    if len(highs) < period + 1: return 0.0
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(1, len(highs))]
+    atr_val = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr_val = (atr_val * (period - 1) + trs[i]) / period
+    return atr_val
+
+def rsi(closes, period=14):
+    if len(closes) < period + 1: return 50.0
+    gains = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [abs(min(closes[i] - closes[i-1], 0)) for i in range(1, len(closes))]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+# ==================== ANÁLISE ====================
+def analyze():
+    global last_analysis
+    last_analysis = time.time()
+    signals = []
+    for pair, sym, bgsym in PAIRS:
+        try:
+            ohlc_data = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": 60}, timeout=15).json()
+            ohlc = ohlc_data["result"][list(ohlc_data["result"].keys())[0]]
+            closes = [float(c[4]) for c in ohlc]
+            highs = [float(c[2]) for c in ohlc]
+            lows = [float(c[3]) for c in ohlc]
+            ticker_data = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair}, timeout=10).json()
+            t = ticker_data["result"][list(ticker_data["result"].keys())[0]]
+            price = float(t["c"][0])
+            op = float(t["o"])
+            change = round((price - op) / op * 100, 2)
+
+            r = rsi(closes)
+            e20 = ema_arr(closes, 20)
+            e50 = ema_arr(closes, 50)
+            bull = e20[-1] > e50[-1]
+            macd_line, signal_line, hist = macd(closes)
+            atr_val = atr(highs, lows, closes)
+            funding = get_funding_rate(bgsym)
+
+            score = 0
+            reasons = []
+
+            if r < 30: score += 3; reasons.append("RSI sobrevendido")
+            elif r < 40: score += 1; reasons.append("RSI baixo")
+            elif r > 70: score -= 3; reasons.append("RSI sobrecomprado")
+            elif r > 60: score -= 1; reasons.append("RSI alto")
+
+            if bull: score += 2; reasons.append("EMA bullish")
+            else: score -= 2; reasons.append("EMA bearish")
+            if price > e20[-1] and bull: score += 1
+            elif price < e20[-1] and not bull: score -= 1
+
+            if macd_line > signal_line and hist > 0:
+                score += 2; reasons.append("MACD bullish")
+            elif macd_line < signal_line and hist < 0:
+                score -= 2; reasons.append("MACD bearish")
+
+            if funding > 0.01 and bull:
+                score -= 1; reasons.append(f"Funding alto ({funding:.3f}%)")
+            elif funding < -0.01 and not bull:
+                score -= 1; reasons.append(f"Funding baixo ({funding:.3f}%)")
+
+            if score >= 4:
+                label = "🟢 LONG FORTE"
+                signals.append(((sym, price, change, r, label, score, reasons, atr_val), ohlc, e20, e50, bgsym))
+            elif score <= -4:
+                label = "🔴 SHORT FORTE"
+                signals.append(((sym, price, change, r, label, score, reasons, atr_val), ohlc, e20, e50, bgsym))
+
+            print(f"{sym}: RSI={r} MACD={hist:+.4f} ATR={atr_val:.6f} Funding={funding:.3f}% score={score}")
+            time.sleep(0.6)
+        except Exception as e:
+            print(f"Erro {sym}: {e}")
+    return signals
+
+def enviar_sinal(sig, ohlc, e20, e50, bgsym):
+    sym, price, change, rsi_v, label, score, reasons, atr_val = sig
+    sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
+    lev = min(alav, MAX_LEV)
+    arrow = "↑" if "LONG" in label else "↓"
+    cap = f"{arrow} <b>{sym}/USD — {label} v3.3</b>\n━━━━━━━━━━━━━━━\n"
+    cap += f"💲 Entrada: ${fmt(price)}\n"
+    cap += f"🛑 SL: ${fmt(sl)} (ATR)\n"
+    cap += f"🎯 TP1: ${fmt(tp1)}\n"
+    cap += f"🎯 TP2: ${fmt(tp2)}\n"
+    cap += f"⚡ Alavancagem: {lev}x\n"
+    cap += "━━━━━━━━━━━━━━━\n"
+    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}/9\n"
+    cap += f"📌 {', '.join(reasons)}\n"
+    cap += "━━━━━━━━━━━━━━━\n"
+    cap += "💰 <b>ENTRAR?</b>\n✅ Responde: <b>sim VALOR</b> (ex: sim 5)\n❌ Ou: <b>não</b>\n"
+    cap += "⚠️ <i>Não é aconselhamento financeiro.</i>"
+    pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
+    buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
+    if buf:
+        send_photo(buf, cap)
+    else:
+        send(cap)
+
+def process_replies():
+    global last_update_id
+    for u in get_updates():
+        last_update_id = u["update_id"]
+        text = u.get("message", {}).get("text", "").strip().lower()
+        if not text or text.startswith("/"): continue
+        if CHAT_ID not in pending: continue
+        if text in ("não", "nao", "n", "no"):
+            send("❌ Sinal cancelado.")
+            pending.pop(CHAT_ID, None)
+            continue
+        if text.startswith(("sim", "s ")):
+            partes = text.replace("sim", "").replace("s", "").strip().split()
+            try:
+                margem = float(partes[0].replace("$", "").replace(",", "."))
+                sig, ohlc, e20, e50, bgsym = pending[CHAT_ID]
+                send(f"⏳ A abrir posição com ${margem}...")
+                executar_trade(sig, bgsym, margem)
+                pending.pop(CHAT_ID, None)
+            except Exception as e:
+                send(f"⚠️ Formato errado. Ex: <b>sim 5</b>")
+
+# ==================== LOOP PRINCIPAL ====================
+print("🤖 Bot iniciado! (versão v3.3 — Precisão de tamanho corrigida)")
+send("🤖 <b>FuturesScan Bot v3.3</b>\n✅ Pares dinâmicos + correção de tamanho\nPodes testar com $1 ou $2")
+
+while True:
+    process_replies()
+    if time.time() - last_analysis >= 3600:
+        print("A analisar mercado (v3.3)...")
+        try:
+            signals = analyze()
+            for item in signals:
+                sig, ohlc, e20, e50, bgsym = item
+                enviar_sinal(sig, ohlc, e20, e50, bgsym)
+                break
+            if not signals:
+                print("Sem sinais fortes esta hora.")
+        except Exception as e:
+            print(f"Erro geral: {e}")
+    time.sleep(3)
