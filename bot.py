@@ -13,7 +13,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = True   # <<< TESTE: True = simula sem dinheiro real. Mudar para False quando confirmado.
+DRY_RUN = True   # <<< True = simula sem dinheiro. Mudar para False quando confirmado.
 
 pending = {}
 last_update_id = 0
@@ -325,12 +325,42 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym):
     if buf: send_photo(buf, cap)
     else: send(cap)
 
+def forcar_teste(symbol):
+    symbol = symbol.upper()
+    alvo = None
+    for pair,sym,bgsym in PAIRS:
+        if sym == symbol:
+            alvo = (pair,sym,bgsym); break
+    if not alvo:
+        nomes = ", ".join(p[1] for p in PAIRS)
+        send(f"⚠️ Par '{symbol}' não existe.\nDisponíveis: {nomes}\nEx: /teste LTC")
+        return
+    pair,sym,bgsym = alvo
+    try:
+        od=requests.get("https://api.kraken.com/0/public/OHLC",params={"pair":pair,"interval":60},timeout=15).json()
+        ohlc=od["result"][list(od["result"].keys())[0]]
+        closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
+        td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
+        t=td["result"][list(td["result"].keys())[0]]
+        price=float(t["c"][0]); op=float(t["o"]); change=round((price-op)/op*100,2)
+        r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
+        bull=e20[-1]>e50[-1]; atr_val=atr(highs,lows,closes)
+        label = "🟢 LONG FORTE" if bull else "🔴 SHORT FORTE"
+        sig=(sym,price,change,r,label,0,["TESTE MANUAL"],atr_val)
+        send(f"🧪 <b>Teste forçado: {sym}</b> (direção pela tendência atual)")
+        enviar_sinal(sig,ohlc,e20,e50,bgsym)
+    except Exception as e:
+        send(f"⚠️ Erro no teste: {e}")
+
 def process_replies():
     global last_update_id
     for u in get_updates():
         last_update_id = u["update_id"]
         text = u.get("message",{}).get("text","").strip().lower()
-        if not text or text.startswith("/"): continue
+        if not text: continue
+        if text.startswith("/teste"):
+            p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
+        if text.startswith("/"): continue
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
             send("❌ Sinal cancelado.")
@@ -350,7 +380,7 @@ def process_replies():
 # ==================== LOOP ====================
 modo = "🔬 DRY RUN (teste)" if DRY_RUN else "💵 REAL"
 print(f"Bot iniciado! Modo: {modo}")
-send(f"🤖 <b>FuturesScan Bot</b>\nModo: <b>{modo}</b>\n⚡ Máx {MAX_LEV}x | 🛡️ SL+TP automático\nQuando houver sinal, pergunto se entras.")
+send(f"🤖 <b>FuturesScan Bot</b>\nModo: <b>{modo}</b>\n⚡ Máx {MAX_LEV}x | 🛡️ SL+TP automático\n🧪 Testa já com: <b>/teste LTC</b>")
 
 while True:
     process_replies()
