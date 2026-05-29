@@ -21,7 +21,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
 
 MAX_LEV = 3
-DRY_RUN = False   # Muda para True apenas para testes sem abrir ordens
+DRY_RUN = False   # Muda para True apenas para testes sem abrir ordens reais
 
 pending = {}
 last_update_id = 0
@@ -88,7 +88,6 @@ def get_dynamic_pairs():
         data = r.json()
         if data.get("code") != "00000" or not data.get("data"):
             raise Exception("Resposta inválida")
-
         contracts = data.get("data", [])
         kraken_map = {
             "BTCUSDT": ("XBTUSD", "BTC"), "ETHUSDT": ("ETHUSD", "ETH"),
@@ -103,14 +102,12 @@ def get_dynamic_pairs():
             "SUIUSDT": ("SUIUSD", "SUI"), "TONUSDT": ("TONUSD", "TON"),
             "INJUSDT": ("INJUSD", "INJ"),
         }
-
         dynamic_pairs = []
         for c in contracts:
             symbol = c.get("symbol")
             if symbol in kraken_map:
                 kraken_pair, display_sym = kraken_map[symbol]
                 dynamic_pairs.append((kraken_pair, display_sym, symbol))
-
         print(f"✅ Carregados {len(dynamic_pairs)} pares dinâmicos da Bitget")
         return dynamic_pairs
     except Exception as e:
@@ -128,9 +125,8 @@ ORIGINAL_PAIRS = [
 
 PAIRS = get_dynamic_pairs()
 
-# ==================== PRECISÃO DO CONTRATO (novo na v3.3) ====================
+# ==================== PRECISÃO DO CONTRATO (v3.3) ====================
 contract_precision = {}
-
 def get_contract_precision(bgsym):
     if bgsym in contract_precision:
         return contract_precision[bgsym]
@@ -144,17 +140,16 @@ def get_contract_precision(bgsym):
             return vol_place
     except:
         pass
-    return 4  # fallback seguro
+    return 4
 
-# ==================== CÁLCULO DE TAMANHO (corrigido v3.3) ====================
 def calc_size(notional, price, bgsym):
     precision = get_contract_precision(bgsym)
     s = notional / price
     multiplier = 10 ** precision
     size = round(s * multiplier) / multiplier
-    return max(size, 0.001)  # mínimo seguro
+    return max(size, 0.001)
 
-# ==================== RESTO DO CÓDIGO ====================
+# ==================== RESTO DAS FUNÇÕES ====================
 def check_open_position(symbol):
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
     if resp.get("code") != "00000": return False
@@ -202,11 +197,9 @@ def executar_trade(sig, bgsym, margem):
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
     lev = min(alav, MAX_LEV)
     notional = margem * lev
-    size = calc_size(notional, price, bgsym)          # ← CORRIGIDO
-
+    size = calc_size(notional, price, bgsym)
     r1 = bg_set_leverage(bgsym, lev)
     r2 = bg_place_order(bgsym, is_long, size, sl, tp1)
-
     if r2.get("code") == "00000":
         arrow = "↑" if is_long else "↓"
         m = f"✅ <b>POSIÇÃO ABERTA v3.3!</b>\n━━━━━━━━━━━━━━━\n"
@@ -223,28 +216,109 @@ def executar_trade(sig, bgsym, margem):
     else:
         send(f"❌ Erro ao abrir: {r2.get('msg','?')}")
 
-# ==================== GRÁFICO E ANÁLISE (igual à v3.2) ====================
-# (O resto do código é idêntico à v3.2 que enviei anteriormente – indicadores, make_chart, analyze, enviar_sinal, process_replies, loop principal)
+# ==================== GRÁFICO ====================
+def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
+    try:
+        candles = ohlc[-50:]
+        opens = [float(c[1]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        xs = list(range(len(candles)))
+        fig, ax = plt.subplots(figsize=(10, 5))
+        fig.patch.set_facecolor('#0d1318')
+        ax.set_facecolor('#0d1318')
+        for i, x in enumerate(xs):
+            o, h, l, c = opens[i], highs[i], lows[i], closes[i]
+            color = '#00e676' if c >= o else '#ff3d5a'
+            ax.plot([x, x], [l, h], color=color, linewidth=0.8)
+            ax.add_patch(plt.Rectangle((x - 0.3, min(o, c)), 0.6, abs(c - o), color=color, zorder=3))
+        ax.plot(xs, ema20[-50:], color='#4a9eff', linewidth=1.2, label='EMA20')
+        ax.plot(xs, ema50[-50:], color='#ffd166', linewidth=1.2, label='EMA50')
+        ax.axhline(price, color='#ffffff', linewidth=1.2, linestyle='--', label=f'Entrada ${fmt(price)}')
+        ax.axhline(sl, color='#ff3d5a', linewidth=1.2, linestyle='--', label=f'SL ${fmt(sl)}')
+        ax.axhline(tp1, color='#00e676', linewidth=1.0, linestyle=':', label=f'TP1 ${fmt(tp1)}')
+        ax.axhline(tp2, color='#00e676', linewidth=1.2, linestyle='--', label=f'TP2 ${fmt(tp2)}')
+        ax.tick_params(colors='#4a6070', labelsize=7)
+        for sp in ax.spines.values(): sp.set_color('#1a2430')
+        ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
+        ax.xaxis.set_tick_params(labelbottom=False)
+        ax.grid(color='#1a2430', linewidth=0.5, alpha=0.5)
+        d = "LONG" if "LONG" in signal else "SHORT"
+        ax.set_title(f'{sym}/USD - {d} | 50 velas (1h) v3.3', color='#c8d8e8', fontsize=10, pad=10)
+        ax.legend(loc='upper left', fontsize=7, facecolor='#0d1318', edgecolor='#1a2430', labelcolor='#c8d8e8')
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=120, facecolor='#0d1318')
+        plt.close()
+        return buf
+    except Exception as e:
+        print(f"Erro gráfico: {e}")
+        return None
 
-# Para não tornar esta mensagem gigantesca, o resto do código é exatamente o mesmo da v3.2 que te enviei antes.
+# ==================== INDICADORES ====================
+def ema_arr(closes, period):
+    if len(closes) < period:
+        return [closes[-1]] * len(closes)
+    k = 2 / (period + 1)
+    ema = sum(closes[:period]) / period
+    result = list(closes[:period])
+    for price in closes[period:]:
+        ema = price * k + ema * (1 - k)
+        result.append(ema)
+    return result
 
-# Se quiseres o ficheiro 100% completo numa única mensagem, confirma que queres que eu cole tudo novamente.
+def macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow: return 0, 0, 0
+    ema_fast = ema_arr(closes, fast)
+    ema_slow = ema_arr(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema_arr(macd_line, signal)
+    histogram = macd_line[-1] - signal_line[-1]
+    return macd_line[-1], signal_line[-1], histogram
 
-print("🤖 Bot iniciado! (versão v3.3 — Precisão de tamanho corrigida)")
-send("🤖 <b>FuturesScan Bot v3.3</b>\n✅ Pares dinâmicos + correção de tamanho Bitget\nPodes testar com $1 ou $2")
+def atr(highs, lows, closes, period=14):
+    if len(highs) < period + 1: return 0.0
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1])) for i in range(1, len(highs))]
+    atr_val = sum(trs[:period]) / period
+    for i in range(period, len(trs)):
+        atr_val = (atr_val * (period - 1) + trs[i]) / period
+    return atr_val
 
-while True:
-    process_replies()
-    if time.time() - last_analysis >= 3600:
-        print("A analisar mercado (v3.3)...")
+def rsi(closes, period=14):
+    if len(closes) < period + 1: return 50.0
+    gains = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
+    losses = [abs(min(closes[i] - closes[i-1], 0)) for i in range(1, len(closes))]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+# ==================== ANÁLISE ====================
+def analyze():
+    global last_analysis
+    last_analysis = time.time()
+    signals = []
+    for pair, sym, bgsym in PAIRS:
         try:
-            signals = analyze()
-            for item in signals:
-                sig, ohlc, e20, e50, bgsym = item
-                enviar_sinal(sig, ohlc, e20, e50, bgsym)
-                break
-            if not signals:
-                print("Sem sinais fortes esta hora.")
-        except Exception as e:
-            print(f"Erro geral: {e}")
-    time.sleep(3)
+            ohlc_data = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": 60}, timeout=15).json()
+            ohlc = ohlc_data["result"][list(ohlc_data["result"].keys())[0]]
+            closes = [float(c[4]) for c in ohlc]
+            highs = [float(c[2]) for c in ohlc]
+            lows = [float(c[3]) for c in ohlc]
+            ticker_data = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair}, timeout=10).json()
+            t = ticker_data["result"][list(ticker_data["result"].keys())[0]]
+            price = float(t["c"][0])
+            op = float(t["o"])
+            change = round((price - op) / op * 100, 2)
+
+            r = rsi(closes)
+            e20 = ema_arr(closes, 20)
+            e50 = ema_arr(closes, 50)
+            bull = e20[-1] > e50[-1]
+            macd_line, signal_line, hist = macd(closes)
+            atr_val = atr(highs, lows, closes)
