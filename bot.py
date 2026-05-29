@@ -80,7 +80,7 @@ def bg_request(method, path, body_dict=None):
         print(f"Erro Bitget: {e}")
         return {"code": "99999", "msg": str(e)}
 
-# ==================== PARES + PRECISÃO ====================
+# ==================== PARES DINÂMICOS + PRECISÃO ====================
 def get_dynamic_pairs():
     try:
         url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
@@ -426,7 +426,7 @@ def process_replies():
 
 # ==================== LOOP PRINCIPAL ====================
 print("🤖 Bot iniciado! (versão v3.5 — SL/TP corrigidos)")
-send("🤖 <b>FuturesScan Bot v3.5</b>\n✅ SL e TP agora são colocados corretamente\nTesta com $1 ou $2")
+send("🤖 <b>FuturesScan Bot v3.5</b>\n✅ SL e TP agora são colocados corretamente\nTenta com sim 5")
 
 while True:
     process_replies()
