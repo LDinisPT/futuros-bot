@@ -80,7 +80,7 @@ def bg_request(method, path, body_dict=None):
         print(f"Erro Bitget: {e}")
         return {"code": "99999", "msg": str(e)}
 
-# ==================== PARES DINÂMICOS + PRECISÃO ====================
+# ==================== PARES + PRECISÃO ====================
 def get_dynamic_pairs():
     try:
         url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
@@ -158,6 +158,7 @@ def round_price(price, bgsym):
     print(f"DEBUG PRICE - {bgsym} | Original: ${price:.6f} | Rounded: ${rounded:.6f}")
     return rounded
 
+# ==================== TRADING ====================
 def check_open_position(symbol):
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"symbol": symbol, "productType": "USDT-FUTURES"})
     if resp.get("code") != "00000": return False
@@ -181,7 +182,7 @@ def bg_place_order(symbol, is_long, size, sl, tp):
     side = "buy" if is_long else "sell"
     sl_rounded = round_price(sl, symbol)
     tp_rounded = round_price(tp, symbol)
-    print(f"DEBUG ORDER - {symbol} | SL: ${sl_rounded:.6f} | TP: ${tp_rounded:.6f}")
+    print(f"DEBUG ORDER - {symbol} | SL: ${sl_rounded:.6f} | TP: ${tp_rounded:.6f} | Size: {size}")
     return bg_request("POST", "/api/v2/mix/order/place-order", {
         "symbol": symbol,
         "productType": "USDT-FUTURES",
@@ -425,7 +426,7 @@ def process_replies():
 
 # ==================== LOOP PRINCIPAL ====================
 print("🤖 Bot iniciado! (versão v3.5 — SL/TP corrigidos)")
-send("🤖 <b>FuturesScan Bot v3.5</b>\n✅ SL e TP agora são colocados corretamente\nPodes testar com $1 ou $2")
+send("🤖 <b>FuturesScan Bot v3.5</b>\n✅ SL e TP agora são colocados corretamente\nTesta com $1 ou $2")
 
 while True:
     process_replies()
