@@ -15,15 +15,16 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.2"
+VERSAO = "v5.3"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
+ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
 
 pending = {}
 last_update_id = 0
 last_analysis = 0
 last_position_check = 0
-posicoes_abertas_cache = {}  # rastreia posições abertas
+posicoes_abertas_cache = {}
 
 def send(msg):
     try:
@@ -207,6 +208,15 @@ def calc_levels(price, signal, atr_val):
         return price - atr_val*sl_m, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
     return price + atr_val*sl_m, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
 
+def get_funding_rate(symbol):
+    try:
+        resp = bg_request("GET", "/api/v2/mix/market/funding-rate", {"symbol": symbol})
+        if resp.get("code") == "00000" and resp.get("data"):
+            return float(resp["data"][0].get("fundingRate", 0))
+    except:
+        pass
+    return 0
+
 def perda_hoje():
     resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
     if resp.get("code") != "00000": return 0
@@ -315,7 +325,6 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
     m += f"📉 Risco: <b>${risco_real:.2f}</b>\n📋 {extra}\n━━━━━━━━━━━━━━━"
     send(m)
     
-    # Registar no cache para tracking
     posicoes_abertas_cache[bgsym] = {
         "sym": sym,
         "lado": direcao,
@@ -328,7 +337,7 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
 def verificar_posicoes_fechadas():
     global last_position_check, posicoes_abertas_cache
     
-    if time.time() - last_position_check < 300:  # a cada 5 min
+    if time.time() - last_position_check < 300:
         return
     
     last_position_check = time.time()
@@ -342,10 +351,8 @@ def verificar_posicoes_fechadas():
     posicoes_atuais = {p.get("symbol"): p for p in resp.get("data", []) 
                        if float(p.get("total",0)) > 0}
     
-    # Detectar fechos
     for bgsym, info_antiga in list(posicoes_abertas_cache.items()):
         if bgsym not in posicoes_atuais:
-            # Posição foi fechada! Obter resultado
             resp_hist = bg_request("GET", "/api/v2/mix/position/history-position", 
                                   {"productType":"USDT-FUTURES","limit":"10"})
             if resp_hist.get("code") == "00000":
@@ -360,9 +367,6 @@ def verificar_posicoes_fechadas():
                         m += f"<b>{info_antiga['sym']}/USDT {info_antiga['lado']}</b>\n"
                         m += f"💲 Entrada: ~${fmt(info_antiga['entrada'])}\n"
                         m += f"💰 Resultado: <b>${pnl:+.4f}</b>\n"
-                        if info_antiga['entrada'] > 0:
-                            taxa = (pnl / (info_antiga['entrada'] * 0.1)) * 100  # simplificado
-                            m += f"📈 Taxa: {taxa:+.1f}%\n"
                         m += f"⏱️ Duração: {tempo_aberto}m\n"
                         m += f"📋 Modo: {info_antiga['modo']}"
                         send(m)
@@ -437,18 +441,61 @@ def rsi(c, p=14):
     if al==0: return 100.0
     return round(100-(100/(1+ag/al)),1)
 
+# ==================== CANDLESTICK PATTERNS ====================
+def detect_engulfing(ohlc):
+    """Detecta padrão Engulfing (bullish ou bearish)"""
+    if len(ohlc) < 2: return 0
+    o1, c1 = float(ohlc[-2][1]), float(ohlc[-2][4])
+    o2, c2 = float(ohlc[-1][1]), float(ohlc[-1][4])
+    
+    # Engulfing bullish: vela vermelha seguida de vela verde grande
+    if c1 < o1 and c2 > o2 and o2 < c1 and c2 > o1:
+        return 2  # Reforça LONG
+    # Engulfing bearish: vela verde seguida de vela vermelha grande
+    if c1 > o1 and c2 < o2 and o2 > c1 and c2 < o1:
+        return -2  # Reforça SHORT
+    return 0
+
+def detect_rejection(ohlc):
+    """Detecta rejeição de resistência/suporte"""
+    if len(ohlc) < 2: return 0
+    o, h, l, c = float(ohlc[-1][1]), float(ohlc[-1][2]), float(ohlc[-1][3]), float(ohlc[-1][4])
+    
+    body = abs(c - o)
+    wick_top = h - max(o, c)
+    wick_bottom = min(o, c) - l
+    
+    # Rejeição de resistência: cauda grande no topo
+    if wick_top > body * 1.5 and c < o:
+        return -1  # Rejeição bearish
+    # Rejeição de suporte: cauda grande no fundo
+    if wick_bottom > body * 1.5 and c > o:
+        return 1  # Rejeição bullish
+    return 0
+
+def detect_inside_bar(ohlc):
+    """Detecta consolidação (inside bar)"""
+    if len(ohlc) < 2: return 0
+    o1, h1, l1 = float(ohlc[-2][1]), float(ohlc[-2][2]), float(ohlc[-2][3])
+    h2, l2 = float(ohlc[-1][2]), float(ohlc[-1][3])
+    
+    # Vela atual dentro da vela anterior
+    if h2 <= h1 and l2 >= l1:
+        return 0.5  # Consolidação (reforça qualquer sinal)
+    return 0
+
 # ==================== ANALISE ====================
 def analyze():
     global last_analysis
-    last_analysis=time.time()
-    signals=[]
-    for pair,sym,bgsym in PAIRS:
+    last_analysis = time.time()
+    signals = []
+    for pair, sym, bgsym in PAIRS:
         try:
-            od=requests.get("https://api.kraken.com/0/public/OHLC",params={"pair":pair,"interval":60},timeout=15).json()
-            ohlc=od["result"][list(od["result"].keys())[0]]
+            od = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair":pair,"interval":60}, timeout=15).json()
+            ohlc = od["result"][list(od["result"].keys())[0]]
             closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
             volumes=[float(c[6]) for c in ohlc]
-            td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
+            td=requests.get("https://api.kraken.com/0/public/Ticker", params={"pair":pair}, timeout=10).json()
             t=td["result"][list(td["result"].keys())[0]]
             price=float(t["c"][0]); op=float(t["o"])
             r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
@@ -457,6 +504,15 @@ def analyze():
             vol_recente = sum(volumes[-5:]) / 5
             vol_medio = sum(volumes[-25:-5]) / 20 if len(volumes)>=25 else vol_recente
             vol_ratio = vol_recente / vol_medio if vol_medio else 1
+            
+            # Funding Rate
+            funding = get_funding_rate(bgsym)
+            
+            # Candlestick Patterns
+            engulfing = detect_engulfing(ohlc)
+            rejection = detect_rejection(ohlc)
+            inside_bar = detect_inside_bar(ohlc)
+            
             score=0; reasons=[]
             if r<30: score+=3; reasons.append("RSI sobrevendido")
             elif r<40: score+=1
@@ -468,11 +524,31 @@ def analyze():
             elif ml<sl_ and hist<0: score-=2; reasons.append("MACD bearish")
             if vol_ratio > 1.3 and score>0: score+=1; reasons.append("Volume↑")
             elif vol_ratio < 0.6: score = int(score * 0.7); reasons.append("Volume baixo")
+            
+            # Funding Rate impact
+            if score > 0 and funding > 0.03:
+                score -= 1; reasons.append(f"Funding alto ({funding:+.3%})")
+            elif score < 0 and funding < -0.03:
+                score += 1; reasons.append(f"Funding baixo ({funding:+.3%})")
+            
+            # Candlestick Patterns
+            if engulfing > 0 and score > 0:
+                score += engulfing; reasons.append("Engulfing bullish ✅")
+            elif engulfing < 0 and score < 0:
+                score += engulfing; reasons.append("Engulfing bearish ✅")
+            
+            if rejection != 0:
+                score += rejection; reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
+            
+            if inside_bar > 0:
+                if score > 0: score += inside_bar; reasons.append("Consolidação bullish")
+                elif score < 0: score += inside_bar; reasons.append("Consolidação bearish")
+            
             if score>=4:
                 signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
             elif score<=-4:
                 signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
-            print(f"{sym}: RSI={r} score={score}")
+            print(f"{sym}: RSI={r} score={score} funding={funding:+.3%}")
             time.sleep(0.6)
         except Exception as e:
             print(f"Erro {sym}: {e}")
@@ -547,7 +623,7 @@ def mostrar_posicoes():
         upl=float(p.get("unrealizedPL",0)); marg=float(p.get("marginSize",0))
         roe=(upl/marg*100) if marg else 0
         arrow="↑" if side=="long" else "↓"
-        m+=f"━━━━━━━\n{arrow} <b>{sym}</b>\n💰 ${upl:+.4f} ({roe:+.1f}%)"
+        m+=f"━━━━━━\n{arrow} <b>{sym}</b>\n💰 ${upl:+.4f} ({roe:+.1f}%)"
     send(m)
 
 def fechar_posicao(symbol):
@@ -597,7 +673,7 @@ def mostrar_stats():
     if resp.get("code")!="00000": send(f"⚠️ Erro"); return
     d = resp.get("data")
     lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
-    if len(lista) < 5: send("📭 Precisa de pelo menos 5 trades para estatísticas"); return
+    if len(lista) < 5: send("📭 Precisa de pelo menos 5 trades"); return
     
     total_pnl = 0; wins = 0; losses = 0; ganhos = []; perdas = []
     duracao_total = 0; count_duracao = 0
@@ -637,7 +713,8 @@ def mostrar_ajuda():
     m += "sim 5 / sim r1 + trail/hibrido\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += f"⚠️ Aviso perda: ${DAILY_LOSS_WARNING}\n"
-    m += f"📏 Limite: ${MAX_NOTIONAL}"
+    m += f"📏 Limite: ${MAX_NOTIONAL}\n"
+    m += f"⏰ Análise: a cada 15 min"
     send(m)
 
 def process_replies():
@@ -678,11 +755,10 @@ def process_replies():
                 modo = "normal"
                 if "trail" in resto: modo = "trail"
                 if "hib" in resto: modo = "hibrido"
-                # aviso drawdown
                 if not has_conf and not DRY_RUN:
                     perda = perda_hoje()
                     if perda <= -DAILY_LOSS_WARNING:
-                        send(f"⚠️ Já perdeste ${abs(perda):.2f} hoje.\nResponde: {text} confirmar")
+                        send(f"⚠️ <b>Aviso:</b> já perdeste <b>${abs(perda):.2f}</b> hoje.\nPara entrar mesmo assim:\n<b>{text} confirmar</b>\nOu <b>não</b> para cancelar.")
                         continue
                 sig, ohlc, e20, e50, bgsym = pending[CHAT_ID]
                 send(f"⏳ A processar ${valor} ({tipo})...")
@@ -694,17 +770,18 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Aviso perda ${DAILY_LOSS_WARNING}\nEscreve /ajuda")
+send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\nEscreve /ajuda")
 
 while True:
     process_replies()
     verificar_posicoes_fechadas()
-    if time.time()-last_analysis >= 3600:
-        print("A analisar...")
+    if time.time()-last_analysis >= ANALYSIS_INTERVAL:
+        print(f"A analisar mercado ({ANALYSIS_INTERVAL}s)...")
         try:
             signals = analyze()
             for item in signals:
                 enviar_sinal(*item); break
+            if not signals: print("Sem sinais fortes.")
         except Exception as e:
             print(f"Erro: {e}")
     time.sleep(3)
