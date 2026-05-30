@@ -15,13 +15,15 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5"
-DAILY_LOSS_WARNING = 5.0   # avisa se já perdeu mais que isto hoje
-MAX_NOTIONAL = 500.0       # limite de posição em $ (segurança)
+VERSAO = "v5.2"
+DAILY_LOSS_WARNING = 5.0
+MAX_NOTIONAL = 500.0
 
 pending = {}
 last_update_id = 0
 last_analysis = 0
+last_position_check = 0
+posicoes_abertas_cache = {}  # rastreia posições abertas
 
 def send(msg):
     try:
@@ -102,10 +104,10 @@ def get_dynamic_pairs():
             raise Exception("resposta invalida")
         valid = {c.get("symbol") for c in data["data"]}
         pairs = [p for p in ORIGINAL_PAIRS if p[2] in valid]
-        print(f"✅ {len(pairs)} pares validos na Bitget")
+        print(f"✅ {len(pairs)} pares validos")
         return pairs if pairs else ORIGINAL_PAIRS
     except Exception as e:
-        print(f"⚠️ Erro pares: {e} - usando fallback")
+        print(f"⚠️ Erro pares: {e}")
         return ORIGINAL_PAIRS
 
 PAIRS = get_dynamic_pairs()
@@ -206,7 +208,7 @@ def calc_levels(price, signal, atr_val):
     return price + atr_val*sl_m, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
 
 def perda_hoje():
-    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"50"})
+    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
     if resp.get("code") != "00000": return 0
     d = resp.get("data")
     lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
@@ -221,6 +223,21 @@ def perda_hoje():
             total += pnl
     return total
 
+def count_trades_hoje():
+    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
+    if resp.get("code") != "00000": return 0
+    d = resp.get("data")
+    lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
+    hoje = time.strftime("%Y-%m-%d", time.gmtime())
+    count = 0
+    for p in lista:
+        utime = int(p.get("utime") or 0)
+        if utime == 0: continue
+        data_fecho = time.strftime("%Y-%m-%d", time.gmtime(utime/1000))
+        if data_fecho == hoje:
+            count += 1
+    return count
+
 def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
     sym, price, _, rsi_v, label, score, reasons, atr_val = sig
     is_long = "LONG" in label
@@ -228,7 +245,6 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
     sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
     lev = min(alav, MAX_LEV)
 
-    # SIZING
     if tipo_valor == "risco":
         distancia = abs(sl - price)
         if distancia <= 0:
@@ -236,8 +252,7 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         size_raw = valor / distancia
         notional = size_raw * price
         if notional > MAX_NOTIONAL:
-            send(f"⚠️ Posição ficaria muito grande (${notional:.0f}). Reduz o risco ou usa modo margem.")
-            return
+            send(f"⚠️ Posição muito grande (${notional:.0f})."); return
         size = round_size(size_raw, bgsym)
         margem = notional / lev
         risco_real = valor
@@ -245,8 +260,7 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         margem = valor
         notional = margem * lev
         if notional > MAX_NOTIONAL:
-            send(f"⚠️ Posição muito grande (${notional:.0f}). Reduz o valor.")
-            return
+            send(f"⚠️ Posição muito grande (${notional:.0f})."); return
         size = calc_size(notional, price, bgsym)
         distancia = abs(sl - price)
         risco_real = size * distancia
@@ -258,21 +272,15 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         m  = f"🔬 <b>DRY RUN — modo {modo.upper()}</b>\n━━━━━━━━━━━━━━━\n"
         m += f"{arrow} {sym}/USDT — {direcao}\n💲 Entrada: ~${fmt(price)}\n"
         m += f"⚡ {lev}x | 💰 Margem ${margem:.2f}\n📊 Size: {size}\n"
-        m += f"🛑 SL: ${fmt(sl)} (risco real ${risco_real:.2f})\n🎯 TP1: ${fmt(tp1)}\n"
-        if modo == "hibrido":
-            metade = round_size(size/2, bgsym)
-            m += f"📋 TP1 50% ({metade}) + trailing {CALLBACK_RATIO}%\n"
-        elif modo == "trail":
-            m += f"📋 Trailing {CALLBACK_RATIO}% 100%\n"
-        else:
-            m += "📋 TP1 100%\n"
-        m += "<i>(DRY_RUN — nada executado)</i>"
+        m += f"🛑 SL: ${fmt(sl)} (risco ${risco_real:.2f})\n🎯 TP1: ${fmt(tp1)}\n"
+        m += "<i>(DRY_RUN)</i>"
         send(m); return
 
     if check_open_position(bgsym):
         send(f"⚠️ Já tens posição em <b>{sym}</b>."); return
 
     bg_set_leverage(bgsym, lev)
+    time.sleep(1)
 
     if modo == "normal":
         r = bg_place_order(bgsym, is_long, size, sl, tp1)
@@ -280,8 +288,7 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         r = bg_place_order(bgsym, is_long, size, sl)
 
     if r.get("code") != "00000":
-        send(f"❌ Erro ao abrir: {r.get('msg','?')} (cod {r.get('code','?')})")
-        return
+        send(f"❌ Erro ao abrir: {r.get('msg','?')}"); return
 
     extra = "TP1 fecha 100%"
     avisos = []
@@ -290,8 +297,8 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         if rt.get("code") == "00000":
             extra = f"Trailing {CALLBACK_RATIO}% (100%)"
         else:
-            avisos.append(f"⚠️ Trailing falhou: {rt.get('msg','?')}")
-            extra = "SL fixo (trailing falhou)"
+            avisos.append(f"⚠️ Trailing falhou")
+            extra = "SL fixo"
     elif modo == "hibrido":
         metade = round_size(size/2, bgsym)
         resto = round_size(size - metade, bgsym)
@@ -300,18 +307,68 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         ok_tp = rtp.get("code") == "00000"
         ok_tr = rtr.get("code") == "00000"
         extra = f"TP1 50% [{'ok' if ok_tp else 'FALHOU'}] + Trailing [{'ok' if ok_tr else 'FALHOU'}]"
-        if not ok_tp: avisos.append(f"⚠️ TP1: {rtp.get('msg','?')}")
-        if not ok_tr: avisos.append(f"⚠️ Trailing: {rtr.get('msg','?')}")
 
     m  = f"✅ <b>POSIÇÃO ABERTA!</b> ({modo})\n━━━━━━━━━━━━━━━\n"
     m += f"{arrow} <b>{sym}/USDT — {direcao}</b>\n💲 Entrada: ~${fmt(price)}\n"
     m += f"⚡ {lev}x | 💰 Margem ${margem:.2f}\n📊 Size: {size}\n"
     m += f"🛑 SL: ${fmt(sl)} | 🎯 TP1: ${fmt(tp1)}\n"
-    m += f"📉 Risco real no SL: <b>${risco_real:.2f}</b>\n"
-    m += f"📋 {extra}\n━━━━━━━━━━━━━━━\n"
-    if avisos: m += "\n".join(avisos) + "\n"
-    m += "⚠️ CONFIRMA na Bitget!"
+    m += f"📉 Risco: <b>${risco_real:.2f}</b>\n📋 {extra}\n━━━━━━━━━━━━━━━"
     send(m)
+    
+    # Registar no cache para tracking
+    posicoes_abertas_cache[bgsym] = {
+        "sym": sym,
+        "lado": direcao,
+        "entrada": price,
+        "modo": modo,
+        "tempo_abertura": time.time()
+    }
+
+# ==================== RASTREAMENTO DE POSIÇÕES ====================
+def verificar_posicoes_fechadas():
+    global last_position_check, posicoes_abertas_cache
+    
+    if time.time() - last_position_check < 300:  # a cada 5 min
+        return
+    
+    last_position_check = time.time()
+    
+    resp = bg_request("GET", "/api/v2/mix/position/all-position",
+                      {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    
+    if resp.get("code") != "00000":
+        return
+    
+    posicoes_atuais = {p.get("symbol"): p for p in resp.get("data", []) 
+                       if float(p.get("total",0)) > 0}
+    
+    # Detectar fechos
+    for bgsym, info_antiga in list(posicoes_abertas_cache.items()):
+        if bgsym not in posicoes_atuais:
+            # Posição foi fechada! Obter resultado
+            resp_hist = bg_request("GET", "/api/v2/mix/position/history-position", 
+                                  {"productType":"USDT-FUTURES","limit":"10"})
+            if resp_hist.get("code") == "00000":
+                d = resp_hist.get("data")
+                lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
+                for p in lista:
+                    if p.get("symbol") == bgsym:
+                        pnl = float(p.get("netProfit") or p.get("pnl") or 0)
+                        tempo_aberto = int((time.time() - info_antiga["tempo_abertura"])/60)
+                        emoji = "🟢" if pnl >= 0 else "🔴"
+                        m = f"{emoji} <b>POSIÇÃO FECHADA</b>\n━━━━━━━━━━━━━━━\n"
+                        m += f"<b>{info_antiga['sym']}/USDT {info_antiga['lado']}</b>\n"
+                        m += f"💲 Entrada: ~${fmt(info_antiga['entrada'])}\n"
+                        m += f"💰 Resultado: <b>${pnl:+.4f}</b>\n"
+                        if info_antiga['entrada'] > 0:
+                            taxa = (pnl / (info_antiga['entrada'] * 0.1)) * 100  # simplificado
+                            m += f"📈 Taxa: {taxa:+.1f}%\n"
+                        m += f"⏱️ Duração: {tempo_aberto}m\n"
+                        m += f"📋 Modo: {info_antiga['modo']}"
+                        send(m)
+                        break
+            
+            del posicoes_abertas_cache[bgsym]
 
 # ==================== GRAFICO ====================
 def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
@@ -332,7 +389,6 @@ def make_chart(ohlc, price, sl, tp1, tp2, sym, signal, ema20, ema50):
         ax.axhline(price,color='#ffffff',linewidth=1.2,linestyle='--',label=f'Entrada ${fmt(price)}')
         ax.axhline(sl,color='#ff3d5a',linewidth=1.2,linestyle='--',label=f'SL ${fmt(sl)}')
         ax.axhline(tp1,color='#00e676',linewidth=1.0,linestyle=':',label=f'TP1 ${fmt(tp1)}')
-        ax.axhline(tp2,color='#00e676',linewidth=1.2,linestyle='--',label=f'TP2 ${fmt(tp2)}')
         ax.tick_params(colors='#4a6070',labelsize=7)
         for sp in ax.spines.values(): sp.set_color('#1a2430')
         ax.yaxis.set_tick_params(labelcolor='#c8d8e8')
@@ -394,60 +450,46 @@ def analyze():
             volumes=[float(c[6]) for c in ohlc]
             td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
             t=td["result"][list(td["result"].keys())[0]]
-            price=float(t["c"][0]); op=float(t["o"]); change=round((price-op)/op*100,2)
+            price=float(t["c"][0]); op=float(t["o"])
             r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
             bull=e20[-1]>e50[-1]
             ml,sl_,hist=macd(closes); atr_val=atr(highs,lows,closes)
-            # filtro de volume
             vol_recente = sum(volumes[-5:]) / 5
             vol_medio = sum(volumes[-25:-5]) / 20 if len(volumes)>=25 else vol_recente
             vol_ratio = vol_recente / vol_medio if vol_medio else 1
             score=0; reasons=[]
             if r<30: score+=3; reasons.append("RSI sobrevendido")
-            elif r<40: score+=1; reasons.append("RSI baixo")
+            elif r<40: score+=1
             elif r>70: score-=3; reasons.append("RSI sobrecomprado")
-            elif r>60: score-=1; reasons.append("RSI alto")
+            elif r>60: score-=1
             if bull: score+=2; reasons.append("EMA bullish")
             else: score-=2; reasons.append("EMA bearish")
-            if price>e20[-1] and bull: score+=1
-            elif price<e20[-1] and not bull: score-=1
             if ml>sl_ and hist>0: score+=2; reasons.append("MACD bullish")
             elif ml<sl_ and hist<0: score-=2; reasons.append("MACD bearish")
-            # volume
-            if vol_ratio > 1.3:
-                if score > 0: score+=1; reasons.append("Volume↑")
-                elif score < 0: score-=1; reasons.append("Volume↑")
-            elif vol_ratio < 0.6:
-                reasons.append("Volume baixo")
-                score = int(score * 0.7)  # reduz força do sinal
+            if vol_ratio > 1.3 and score>0: score+=1; reasons.append("Volume↑")
+            elif vol_ratio < 0.6: score = int(score * 0.7); reasons.append("Volume baixo")
             if score>=4:
-                signals.append(((sym,price,change,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
+                signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
             elif score<=-4:
-                signals.append(((sym,price,change,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
-            print(f"{sym}: RSI={r} MACD={hist:+.4f} VOL={vol_ratio:.2f} score={score}")
+                signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
+            print(f"{sym}: RSI={r} score={score}")
             time.sleep(0.6)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
 
 def enviar_sinal(sig, ohlc, e20, e50, bgsym):
-    sym,price,change,rsi_v,label,score,reasons,atr_val = sig
-    sl,tp1,tp2,alav = calc_levels(price,label,atr_val)
-    lev = min(alav, MAX_LEV)
-    arrow = "↑" if "LONG" in label else "↓"
-    modo = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
-    # exemplos de risco
+    sym,price,_,rsi_v,label,score,reasons,atr_val = sig
+    sl,tp1,tp2,_ = calc_levels(price,label,atr_val)
     dist_pct = abs(sl-price)/price*100
-    risco_5m = 5 * lev * dist_pct/100  # se margem $5
-    cap  = f"{arrow} <b>{sym}/USD — {label}</b> ({modo})\n━━━━━━━━━━━━━━━\n"
-    cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n🎯 TP2: ${fmt(tp2)}\n"
-    cap += f"⚡ Alavancagem: {lev}x\n━━━━━━━━━━━━━━━\n"
-    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons)}\n━━━━━━━━━━━━━━━\n"
-    cap += f"💰 <b>ENTRAR?</b> (margem ou risco)\n"
+    risco_5m = 5 * 3 * dist_pct/100
+    cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
+    cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
+    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons[:3])}\n━━━━━━━━━━━━━━━\n"
+    cap += f"💰 <b>ENTRAR?</b>\n"
     cap += f"✅ <b>sim 5</b> → $5 margem (risco ~${risco_5m:.2f})\n"
-    cap += f"✅ <b>sim r1</b> → arrisca $1 no SL (sizing inteligente)\n"
-    cap += f"➕ adicionar <b>trail</b> ou <b>hibrido</b>\n"
-    cap += f"❌ <b>não</b>"
+    cap += f"✅ <b>sim r1</b> → arrisca $1 no SL\n"
+    cap += f"➕ <b>trail</b> ou <b>hibrido</b>\n❌ <b>não</b>"
     pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
     buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
     if buf: send_photo(buf, cap)
@@ -460,8 +502,7 @@ def forcar_teste(symbol):
         if sym == symbol:
             alvo = (pair,sym,bgsym); break
     if not alvo:
-        nomes = ", ".join(p[1] for p in PAIRS)
-        send(f"⚠️ Par '{symbol}' não existe.\nDisponíveis: {nomes}\nEx: /teste LTC")
+        send(f"⚠️ Par inválido. Ex: /teste LTC")
         return
     pair,sym,bgsym = alvo
     try:
@@ -470,51 +511,43 @@ def forcar_teste(symbol):
         closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
         td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
         t=td["result"][list(td["result"].keys())[0]]
-        price=float(t["c"][0]); op=float(t["o"]); change=round((price-op)/op*100,2)
-        r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
+        price=float(t["c"][0]); r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
         bull=e20[-1]>e50[-1]; atr_val=atr(highs,lows,closes)
         label = "🟢 LONG FORTE" if bull else "🔴 SHORT FORTE"
-        sig=(sym,price,change,r,label,0,["TESTE MANUAL"],atr_val)
-        send(f"🧪 <b>Teste forçado: {sym}</b>")
+        sig=(sym,price,0,r,label,0,["TESTE MANUAL"],atr_val)
+        send(f"🧪 Teste: {sym}")
         enviar_sinal(sig,ohlc,e20,e50,bgsym)
     except Exception as e:
         send(f"⚠️ Erro: {e}")
 
 def mostrar_saldo():
     resp = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
-    if resp.get("code") != "00000":
-        send(f"⚠️ Erro: {resp.get('msg','?')}"); return
+    if resp.get("code") != "00000": send(f"⚠️ Erro"); return
     data = resp.get("data", [])
-    if not data: send("📭 Sem dados."); return
+    if not data: send("📭 Sem dados"); return
     a = data[0]
     equity = float(a.get("accountEquity", a.get("usdtEquity",0)))
     avail = float(a.get("available", 0))
     upl = float(a.get("unrealizedPL", 0))
     perda = perda_hoje()
-    m  = f"💰 <b>SALDO BITGET</b>\n━━━━━━━━━━━━━━━\n"
+    m  = f"💰 <b>SALDO</b>\n━━━━━━━━━━━━━━━\n"
     m += f"💵 Total: ${equity:.2f}\n✅ Disponível: ${avail:.2f}\n"
     m += f"📊 L/P aberto: ${upl:+.2f}\n📅 L/P hoje: ${perda:+.2f}"
     send(m)
 
 def mostrar_posicoes():
     resp = bg_request("GET", "/api/v2/mix/position/all-position", {"productType":"USDT-FUTURES","marginCoin":"USDT"})
-    if resp.get("code") != "00000":
-        send(f"⚠️ Erro: {resp.get('msg','?')}"); return
+    if resp.get("code") != "00000": send(f"⚠️ Erro"); return
     pos = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0]
-    if not pos: send("📭 Sem posições abertas."); return
-    m = f"📊 <b>POSIÇÕES ABERTAS ({len(pos)})</b>\n"
+    if not pos: send("📭 Sem posições"); return
+    m = f"📊 <b>POSIÇÕES ({len(pos)})</b>\n"
     for p in pos:
-        sym = p.get("symbol","?"); side = p.get("holdSide","?")
-        total = float(p.get("total",0)); entry = float(p.get("openPriceAvg",0))
-        upl = float(p.get("unrealizedPL",0)); marg = float(p.get("marginSize",0))
-        liq = float(p.get("liquidationPrice",0) or 0)
-        roe = (upl/marg*100) if marg else 0
-        arrow = "↑" if side=="long" else "↓"
-        m += f"━━━━━━━━━━━━━━━\n"
-        m += f"{arrow} <b>{sym}</b> {side.upper()}\n"
-        m += f"📊 Size: {total} | 💲 Entrada: ${fmt(entry)}\n"
-        m += f"💰 L/P: ${upl:+.4f} ({roe:+.1f}%)\n"
-        m += f"💥 Liquidação: ${fmt(liq)}"
+        sym=p.get("symbol","?"); side=p.get("holdSide","?")
+        total=float(p.get("total",0)); entry=float(p.get("openPriceAvg",0))
+        upl=float(p.get("unrealizedPL",0)); marg=float(p.get("marginSize",0))
+        roe=(upl/marg*100) if marg else 0
+        arrow="↑" if side=="long" else "↓"
+        m+=f"━━━━━━━\n{arrow} <b>{sym}</b>\n💰 ${upl:+.4f} ({roe:+.1f}%)"
     send(m)
 
 def fechar_posicao(symbol):
@@ -525,47 +558,86 @@ def fechar_posicao(symbol):
     for p in resp.get("data", []):
         if p.get("symbol")==symbol and float(p.get("total",0))>0:
             pos = p; break
-    if not pos:
-        send(f"📭 Sem posição em <b>{symbol}</b>."); return
+    if not pos: send(f"📭 Sem posição em {symbol}"); return
     upl = float(pos.get("unrealizedPL",0))
     r = bg_close_position(symbol)
     if r.get("code")=="00000":
         bg_cancel_all(symbol)
-        send(f"✅ <b>{symbol} FECHADA!</b>\n💰 L/P: ~${upl:+.4f}\n🧹 Ordens canceladas.")
-    else:
-        send(f"❌ Erro ao fechar: {r.get('msg','?')}")
+        send(f"✅ <b>{symbol}</b> fechada! L/P: ${upl:+.4f}")
+        posicoes_abertas_cache.pop(symbol, None)
+    else: send(f"❌ Erro: {r.get('msg','?')}")
 
 def mostrar_ganhos():
-    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"50"})
-    if resp.get("code")!="00000":
-        send(f"⚠️ Erro: {resp.get('msg','?')}"); return
+    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
+    if resp.get("code")!="00000": send(f"⚠️ Erro"); return
     d = resp.get("data")
     lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
-    if not lista: send("📭 Sem histórico."); return
-    total=0; wins=0; losses=0; linhas=[]
+    hoje = time.strftime("%Y-%m-%d", time.gmtime())
+    trades_hoje = []
     for p in lista:
+        utime = int(p.get("utime") or 0)
+        if utime == 0: continue
+        data_fecho = time.strftime("%Y-%m-%d", time.gmtime(utime/1000))
+        if data_fecho == hoje:
+            trades_hoje.append(p)
+    if not trades_hoje: send("📭 Sem trades hoje"); return
+    total=0; wins=0; losses=0; linhas=[]
+    for p in trades_hoje:
         sym=p.get("symbol","?")
         pnl=float(p.get("netProfit") or p.get("pnl") or 0)
-        total+=pnl
-        if pnl>0: wins+=1
-        elif pnl<0: losses+=1
+        total+=pnl; wins+=1 if pnl>0 else 0; losses+=1 if pnl<0 else 0
         linhas.append(f"{'🟢' if pnl>=0 else '🔴'} {sym}: ${pnl:+.2f}")
-    m=f"📒 <b>HISTÓRICO ({len(lista)} trades)</b>\n━━━━━━━━━━━━━━━\n"
-    m+="\n".join(linhas[:15])
-    m+=f"\n━━━━━━━━━━━━━━━\n✅ {wins} ganhos | ❌ {losses} perdas\n"
-    m+=f"💰 <b>TOTAL: ${total:+.2f}</b>"
+    m=f"📒 <b>HOJE ({len(trades_hoje)} trades)</b>\n━━━━━━━━━━━━━━━\n"
+    m+="\n".join(linhas)
+    m+=f"\n━━━━━━━━━━━━━━━\n✅ {wins} | ❌ {losses}\n💰 <b>${total:+.2f}</b>"
+    send(m)
+
+def mostrar_stats():
+    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
+    if resp.get("code")!="00000": send(f"⚠️ Erro"); return
+    d = resp.get("data")
+    lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
+    if len(lista) < 5: send("📭 Precisa de pelo menos 5 trades para estatísticas"); return
+    
+    total_pnl = 0; wins = 0; losses = 0; ganhos = []; perdas = []
+    duracao_total = 0; count_duracao = 0
+    
+    for p in lista:
+        pnl = float(p.get("netProfit") or p.get("pnl") or 0)
+        total_pnl += pnl
+        if pnl > 0: wins += 1; ganhos.append(pnl)
+        elif pnl < 0: losses += 1; perdas.append(abs(pnl))
+        
+        ctime = int(p.get("ctime") or 0)
+        utime = int(p.get("utime") or 0)
+        if ctime and utime:
+            duracao_total += (utime - ctime)
+            count_duracao += 1
+    
+    media_ganho = sum(ganhos) / len(ganhos) if ganhos else 0
+    media_perda = sum(perdas) / len(perdas) if perdas else 0
+    profit_factor = (sum(ganhos) / sum(perdas)) if (perdas and sum(perdas) > 0) else 0
+    win_rate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+    duracao_media = duracao_total / count_duracao / 1000 / 60 if count_duracao else 0
+    
+    m = f"📈 <b>ESTATÍSTICAS ({len(lista)} trades)</b>\n━━━━━━━━━━━━━━━\n"
+    m += f"✅ Win rate: {win_rate:.1f}% ({wins}/{wins+losses})\n"
+    m += f"💰 Profit factor: {profit_factor:.2f}x\n"
+    m += f"🎯 Total P&L: ${total_pnl:+.2f}\n"
+    m += f"📊 Média ganho: ${media_ganho:+.4f}\n"
+    m += f"❌ Média perda: ${media_perda:+.4f}\n"
+    m += f"⏱️ Duração média: {duracao_media:.0f}m"
     send(m)
 
 def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
-    m += "/saldo /posicoes /ganhos\n/fechar SOL /teste LTC /ajuda\n━━━━━━━━━━━━━━━\n"
-    m += "<b>Entrar (após sinal):</b>\n"
-    m += "<b>sim 5</b> → $5 margem\n"
-    m += "<b>sim r1</b> → arrisca $1 no SL\n"
-    m += "+ <b>trail</b> ou <b>hibrido</b>\n"
-    m += "<b>não</b> → cancelar\n━━━━━━━━━━━━━━━\n"
-    m += f"⚠️ Aviso se perda diária > ${DAILY_LOSS_WARNING}\n"
-    m += f"📏 Limite posição: ${MAX_NOTIONAL}"
+    m += "/saldo /posicoes /ganhos /stats\n"
+    m += "/fechar SOL /teste LTC /ajuda\n━━━━━━━━━━━━━━━\n"
+    m += "<b>Ao receber sinal:</b>\n"
+    m += "sim 5 / sim r1 + trail/hibrido\n"
+    m += "━━━━━━━━━━━━━━━\n"
+    m += f"⚠️ Aviso perda: ${DAILY_LOSS_WARNING}\n"
+    m += f"📏 Limite: ${MAX_NOTIONAL}"
     send(m)
 
 def process_replies():
@@ -578,65 +650,61 @@ def process_replies():
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
-        if text.startswith("/ganhos") or text.startswith("/historico") or text.startswith("/histórico"): mostrar_ganhos(); continue
+        if text.startswith("/ganhos"): mostrar_ganhos(); continue
+        if text.startswith("/stats"): mostrar_stats(); continue
         if text.startswith("/fechar"):
             p=text.split()
-            if len(p)>1: fechar_posicao(p[1])
-            else: send("Usa: <b>/fechar SOL</b>")
-            continue
+            fechar_posicao(p[1] if len(p)>1 else ""); continue
         if text.startswith("/ajuda") or text.startswith("/start"): mostrar_ajuda(); continue
         if text.startswith("/"): continue
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
-            send("❌ Sinal cancelado."); pending.pop(CHAT_ID, None); continue
+            send("❌ Cancelado"); pending.pop(CHAT_ID, None); continue
         if text.startswith("sim") or text.startswith("s "):
             has_conf = "confirmar" in text
             t_limpo = text.replace("sim","").replace("confirmar","").strip()
             partes = t_limpo.split()
             if not partes:
-                send("⚠️ Formato: <b>sim 5</b> ou <b>sim r1</b>"); continue
+                send("⚠️ Formato: sim 5 ou sim r1"); continue
             try:
                 primeiro = partes[0]
                 if primeiro.startswith("r") and len(primeiro)>1:
-                    valor = float(primeiro[1:].replace(",",".").replace("$",""))
+                    valor = float(primeiro[1:].replace(",","."))
                     tipo = "risco"
                 else:
-                    valor = float(primeiro.replace(",",".").replace("$",""))
+                    valor = float(primeiro.replace(",","."))
                     tipo = "margem"
                 resto = " ".join(partes[1:])
                 modo = "normal"
                 if "trail" in resto: modo = "trail"
                 if "hib" in resto: modo = "hibrido"
-                # aviso de drawdown
+                # aviso drawdown
                 if not has_conf and not DRY_RUN:
                     perda = perda_hoje()
                     if perda <= -DAILY_LOSS_WARNING:
-                        send(f"⚠️ <b>Aviso:</b> já perdeste <b>${abs(perda):.2f}</b> hoje.\n"
-                             f"Pausa para pensar? Se queres mesmo entrar:\n"
-                             f"<b>{text} confirmar</b>\nOu <b>não</b> para cancelar.")
+                        send(f"⚠️ Já perdeste ${abs(perda):.2f} hoje.\nResponde: {text} confirmar")
                         continue
                 sig, ohlc, e20, e50, bgsym = pending[CHAT_ID]
-                etiqueta = f"${valor} {'risco' if tipo=='risco' else 'margem'}"
-                send(f"⏳ A processar {etiqueta} (modo {modo})...")
+                send(f"⏳ A processar ${valor} ({tipo})...")
                 executar_trade(sig, bgsym, valor, modo, tipo)
                 pending.pop(CHAT_ID, None)
             except Exception as e:
-                send(f"⚠️ Formato errado. Ex: <b>sim 5</b> ou <b>sim r1 hibrido</b>\n({e})")
+                send(f"⚠️ Erro: {e}")
 
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
-print(f"Bot {VERSAO} iniciado! Modo: {estado}")
-send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\nModo: <b>{estado}</b>\n⚡ Máx {MAX_LEV}x | Trailing {CALLBACK_RATIO}%\n📏 Limite ${MAX_NOTIONAL} | Aviso perda ${DAILY_LOSS_WARNING}\nEscreve <b>/ajuda</b>")
+print(f"Bot {VERSAO} — {estado}")
+send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Aviso perda ${DAILY_LOSS_WARNING}\nEscreve /ajuda")
 
 while True:
     process_replies()
+    verificar_posicoes_fechadas()
     if time.time()-last_analysis >= 3600:
-        print("A analisar mercado...")
+        print("A analisar...")
         try:
             signals = analyze()
             for item in signals:
                 enviar_sinal(*item); break
-            if not signals: print("Sem sinais fortes.")
         except Exception as e:
-            print(f"Erro geral: {e}")
+            print(f"Erro: {e}")
     time.sleep(3)
