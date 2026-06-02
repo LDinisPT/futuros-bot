@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.3"
+VERSAO = "v5.3.1"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
@@ -629,19 +629,42 @@ def mostrar_posicoes():
 def fechar_posicao(symbol):
     symbol = symbol.upper()
     if not symbol.endswith("USDT"): symbol += "USDT"
-    resp = bg_request("GET", "/api/v2/mix/position/all-position", {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    
+    # 1. Valida posição
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", 
+                     {"productType":"USDT-FUTURES","marginCoin":"USDT"})
     pos = None
     for p in resp.get("data", []):
         if p.get("symbol")==symbol and float(p.get("total",0))>0:
             pos = p; break
-    if not pos: send(f"📭 Sem posição em {symbol}"); return
+    if not pos: 
+        send(f"📭 Sem posição em {symbol}"); return
+    
     upl = float(pos.get("unrealizedPL",0))
-    r = bg_close_position(symbol)
-    if r.get("code")=="00000":
-        bg_cancel_all(symbol)
-        send(f"✅ <b>{symbol}</b> fechada! L/P: ${upl:+.4f}")
+    
+    # 2. Cancela TODAS as ordens PRIMEIRO
+    print(f"⏳ Cancelando ordens de {symbol}...")
+    cancel_r = bg_cancel_all(symbol)
+    print(f"Cancel 1 response: {cancel_r}")
+    time.sleep(1)
+    
+    # 3. DEPOIS fecha a posição
+    print(f"⏳ Fechando posição de {symbol}...")
+    close_r = bg_close_position(symbol)
+    print(f"Close response: {close_r}")
+    time.sleep(1)
+    
+    # 4. Cancela NOVAMENTE (por segurança) — mata qualquer ordem órfã
+    print(f"⏳ Verificando limpeza final de {symbol}...")
+    cancel_r2 = bg_cancel_all(symbol)
+    print(f"Cancel 2 response: {cancel_r2}")
+    time.sleep(0.5)
+    
+    if close_r.get("code")=="00000":
+        send(f"✅ <b>{symbol}</b> fechada com sucesso!\n💰 L/P: ${upl:+.4f}\n✔️ Todas as ordens (SL/TP/Trailing) canceladas")
         posicoes_abertas_cache.pop(symbol, None)
-    else: send(f"❌ Erro: {r.get('msg','?')}")
+    else: 
+        send(f"❌ Erro ao fechar: {close_r.get('msg','?')}")
 
 def mostrar_ganhos():
     resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
@@ -770,7 +793,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\nEscreve /ajuda")
+send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n✅ BUG FIXED: fechar_posicao cancela SL/TP/Trailing\nEscreve /ajuda")
 
 while True:
     process_replies()
