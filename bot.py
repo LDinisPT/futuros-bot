@@ -15,7 +15,8 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.4"
+VERSAO = "v5.5"
+BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
@@ -31,6 +32,26 @@ def send(msg):
         requests.post(f"{API}/sendMessage", json={"chat_id":CHAT_ID,"text":msg,"parse_mode":"HTML"}, timeout=10)
     except Exception as e:
         print(f"Erro telegram: {e}")
+
+def send_with_buttons(msg, buttons):
+    """Envia mensagem com botões inline
+    buttons = [
+        [{"text": "50 h", "callback_data": "50_h"}],
+        [{"text": "50", "callback_data": "50_normal"}, {"text": "Não", "callback_data": "nao"}]
+    ]
+    """
+    try:
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML",
+            "reply_markup": {
+                "inline_keyboard": buttons
+            }
+        }
+        requests.post(f"{API}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erro telegram buttons: {e}")
 
 def send_photo(buf, caption):
     try:
@@ -362,11 +383,19 @@ def verificar_posicoes_fechadas():
                     if p.get("symbol") == bgsym:
                         pnl = float(p.get("netProfit") or p.get("pnl") or 0)
                         tempo_aberto = int((time.time() - info_antiga["tempo_abertura"])/60)
+                        
+                        # Calcula % de ganho
+                        entrada = info_antiga['entrada']
+                        preco_fecho = entrada + (pnl / 254)  # Aproximado
+                        pct_ganho = (pnl / (50 * 3)) * 100 if pnl != 0 else 0  # $50 margem, 3x
+                        
                         emoji = "🟢" if pnl >= 0 else "🔴"
+                        sinal = "+" if pnl >= 0 else ""
+                        
                         m = f"{emoji} <b>POSIÇÃO FECHADA</b>\n━━━━━━━━━━━━━━━\n"
                         m += f"<b>{info_antiga['sym']}/USDT {info_antiga['lado']}</b>\n"
-                        m += f"💲 Entrada: ~${fmt(info_antiga['entrada'])}\n"
-                        m += f"💰 Resultado: <b>${pnl:+.4f}</b>\n"
+                        m += f"💲 Entrada: ${fmt(entrada)}\n"
+                        m += f"💰 Resultado: <b>${sinal}{pnl:+.4f}</b> ({sinal}{pct_ganho:.2f}%)\n"
                         m += f"⏱️ Duração: {tempo_aberto}m\n"
                         m += f"📋 Modo: {info_antiga['modo']}"
                         send(m)
@@ -578,19 +607,29 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
         # Executa automático
         executar_trade(sig, bgsym, 50, "hibrido", "margem")
     else:
-        # ENTRADA MANUAL (score 4-5 ou -4 a -5)
-        risco_5m = 5 * 3 * dist_pct/100
+        # ENTRADA MANUAL (score 4-5 ou -4 a -5) COM BOTÕES
         cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
-        cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
-        cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons[:3])}\n━━━━━━━━━━━━━━━\n"
-        cap += f"💰 <b>ENTRAR?</b>\n"
-        cap += f"✅ <b>50 h</b> → $50, hibrido\n"
-        cap += f"✅ <b>50</b> → $50, normal\n"
-        cap += f"➕ <b>50 t</b> → trailing\n❌ <b>não</b>"
+        cap += f"💲 Entrada: ${fmt(price)} | 📊 RSI: {rsi_v}\n"
+        cap += f"🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%) | Score: {score:+d}\n"
+        cap += f"🎯 TP1: ${fmt(tp1)}\n"
+        cap += f"📌 {', '.join(reasons[:2])}"
+        
+        # Botões de resposta
+        buttons = [
+            [
+                {"text": "✅ 50 Hibrido", "callback_data": "50_h"},
+                {"text": "✅ 50 Normal", "callback_data": "50_normal"}
+            ],
+            [
+                {"text": "➕ 50 Trailing", "callback_data": "50_t"},
+                {"text": "❌ Não", "callback_data": "nao"}
+            ]
+        ]
+        
         pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
         buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
         if buf: send_photo(buf, cap)
-        else: send(cap)
+        else: send_with_buttons(cap, buttons)
 
 def forcar_teste(symbol):
     symbol = symbol.upper()
@@ -757,11 +796,9 @@ def mostrar_ajuda():
     m += "Bot entra $50 hibrido sozinho!\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += "<b>Manual (Score 4-5):</b>\n"
-    m += "<b>50 h</b> → $50, hibrido\n"
-    m += "<b>50</b> → $50, normal\n"
-    m += "<b>50 t</b> → $50, trailing\n"
-    m += "<b>r1 h</b> → $1 risco\n"
-    m += "<b>não</b> → ignora\n"
+    m += "Clica nos BOTÕES:\n"
+    m += "✅ 50 Hibrido | ✅ 50 Normal\n"
+    m += "➕ 50 Trailing | ❌ Não\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += f"⚠️ Aviso perda: ${DAILY_LOSS_WARNING}\n"
     m += f"📏 Limite: ${MAX_NOTIONAL}\n"
@@ -825,7 +862,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ <b>AUTOMÁTICO: Score ≥ 6 entra $50 hibrido sozinho!</b>\n✅ Manual: Score 4-5 pede confirmação\nEscreve /ajuda")
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
 while True:
     process_replies()
