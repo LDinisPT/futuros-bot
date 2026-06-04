@@ -733,33 +733,77 @@ def mostrar_posicoes():
         m+=f"━━━━━━\n{arrow} <b>{sym}</b>\n💰 ${upl:+.4f} ({roe:+.1f}%)"
     send(m)
 
-def fechar_posicao(symbol):
-    """Fecha posição e mostra resultado"""
-    symbol = symbol.upper()
-    if not symbol.endswith("USDT"): symbol += "USDT"
+def menu_fechar():
+    """Menu para fechar posições com botões"""
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", 
+                     {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    
+    if resp.get("code") != "00000":
+        send("⚠️ Erro ao carregar posições"); return
+    
+    pos_list = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0]
+    
+    if not pos_list:
+        send("📭 Sem posições abertas para fechar"); return
+    
+    m = f"🛑 <b>FECHAR POSIÇÃO</b>\n━━━━━━━━━━━━━━━\n\n"
+    buttons = []
+    
+    for i, p in enumerate(pos_list, 1):
+        sym = p.get("symbol","?")
+        side = p.get("holdSide","?")
+        upl = float(p.get("unrealizedPL",0))
+        marg = float(p.get("marginSize",0))
+        roe = (upl/marg*100) if marg else 0
+        arrow = "↑" if side=="long" else "↓"
+        emoji = "🟢" if upl >= 0 else "🔴"
+        
+        m += f"{i}️⃣ {arrow} <b>{sym}</b>\n"
+        m += f"   {emoji} ${upl:+.4f} ({roe:+.1f}%)\n\n"
+        
+        # Botão para fechar
+        buttons.append([{
+            "text": f"✅ Fechar {i}",
+            "callback_data": f"fechar_{sym}"
+        }])
+    
+    m += "━━━━━━━━━━━━━━━\nEscolhe qual fechar:"
+    buttons.append([{"text": "↩️ Voltar", "callback_data": "voltar_menu"}])
+    
+    send_with_buttons(m, buttons)
+
+def fechar_posicao_callback(symbol):
+    """Fecha posição após escolher no menu"""
+    symbol = symbol.upper().strip()
+    
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
     
     resp = bg_request("GET", "/api/v2/mix/position/all-position", 
                      {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    if resp.get("code") != "00000":
+        send(f"⚠️ Erro ao verificar posições"); return
+    
     pos = None
     for p in resp.get("data", []):
-        if p.get("symbol")==symbol and float(p.get("total",0))>0:
-            pos = p; break
+        if p.get("symbol") == symbol and float(p.get("total",0)) > 0:
+            pos = p
+            break
+    
     if not pos: 
-        send(f"📭 Sem posição em {symbol}"); return
+        send(f"📭 Posição {symbol} não encontrada"); return
     
     upl = float(pos.get("unrealizedPL",0))
     marg = float(pos.get("marginSize",0))
     pct = (upl/marg*100) if marg else 0
     
-    print(f"⏳ Cancelando ordens de {symbol}...")
+    print(f"⏳ Fechando {symbol}...")
     cancel_r = bg_cancel_all(symbol)
     time.sleep(1)
     
-    print(f"⏳ Fechando posição de {symbol}...")
     close_r = bg_close_position(symbol)
     time.sleep(1)
     
-    print(f"⏳ Verificando limpeza final de {symbol}...")
     cancel_r2 = bg_cancel_all(symbol)
     time.sleep(0.5)
     
@@ -773,6 +817,7 @@ def fechar_posicao(symbol):
         m += f"✔️ Todas as ordens canceladas"
         send(m)
         posicoes_abertas_cache.pop(symbol, None)
+        time.sleep(1)
         mostrar_dashboard()
     else: 
         send(f"❌ Erro: {close_r.get('msg','?')}")
@@ -860,6 +905,19 @@ def process_replies():
     global last_update_id
     for u in get_updates():
         last_update_id = u["update_id"]
+        
+        # Callback query (botões clicados)
+        if "callback_query" in u:
+            callback = u["callback_query"]
+            callback_data = callback.get("data", "")
+            callback_msg_id = callback.get("message", {}).get("message_id")
+            
+            if callback_data.startswith("fechar_"):
+                symbol = callback_data.replace("fechar_", "")
+                fechar_posicao_callback(symbol)
+                continue
+            continue
+        
         text = u.get("message",{}).get("text","").strip().lower()
         if not text: continue
         if text.startswith("/teste"):
@@ -869,8 +927,7 @@ def process_replies():
         if text.startswith("/ganhos"): mostrar_ganhos(); continue
         if text.startswith("/stats"): mostrar_stats(); continue
         if text.startswith("/fechar"):
-            p=text.split()
-            fechar_posicao(p[1] if len(p)>1 else ""); continue
+            menu_fechar(); continue
         if text.startswith("/ajuda") or text.startswith("/start"): mostrar_ajuda(); continue
         if text.startswith("/"): continue
         if CHAT_ID not in pending: continue
