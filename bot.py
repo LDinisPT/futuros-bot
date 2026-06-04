@@ -15,8 +15,11 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.5"
+VERSAO = "v5.6"
 BOT_NAME = "FuturesScan Bot de Dinis"
+
+# Estados do bot
+estado_menu = {}  # Rastreia em que menu está cada user
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
@@ -33,25 +36,82 @@ def send(msg):
     except Exception as e:
         print(f"Erro telegram: {e}")
 
-def send_with_buttons(msg, buttons):
-    """Envia mensagem com botões inline
+def mostrar_dashboard_startup():
+    """Mostra dashboard completo ao arrancar o bot"""
+    resp_acc = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
+    if resp_acc.get("code") != "00000":
+        send(f"⚠️ Erro ao carregar dashboard")
+        return
+    
+    data = resp_acc.get("data", [])
+    if not data:
+        send("📭 Sem dados de conta")
+        return
+    
+    a = data[0]
+    equity = float(a.get("accountEquity", a.get("usdtEquity",0)))
+    avail = float(a.get("available", 0))
+    upl = float(a.get("unrealizedPL", 0))
+    perda = perda_hoje()
+    
+    # Dashboard header
+    m = f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n"
+    m += f"💵 REAL | ⚡ Máx 3x | 🔄 Polling 15min\n"
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    # Saldo
+    m += f"💰 <b>SALDO</b>\n"
+    m += f"💵 Total: <b>${equity:.2f}</b>\n"
+    m += f"✅ Disponível: ${avail:.2f}\n"
+    m += f"📊 L/P aberto: <b>${upl:+.2f}</b>\n"
+    m += f"📅 L/P hoje: <b>${perda:+.2f}</b>\n"
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    # Posições
+    resp_pos = bg_request("GET", "/api/v2/mix/position/all-position", 
+                         {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    pos = [p for p in resp_pos.get("data", []) if float(p.get("total",0)) > 0] if resp_pos.get("code") == "00000" else []
+    
+    if pos:
+        m += f"📊 <b>POSIÇÕES ({len(pos)} abertas)</b>\n"
+        for i, p in enumerate(pos, 1):
+            sym = p.get("symbol","?")
+            side = p.get("holdSide","?")
+            upl_pos = float(p.get("unrealizedPL",0))
+            marg = float(p.get("marginSize",0))
+            roe = (upl_pos/marg*100) if marg else 0
+            arrow = "↑" if side=="long" else "↓"
+            emoji_ganho = "🟢" if upl_pos >= 0 else "🔴"
+            m += f"{i}️⃣ {arrow} <b>{sym}</b> {emoji_ganho} ${upl_pos:+.2f} ({roe:+.1f}%)\n"
+        m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    else:
+        m += "📭 Sem posições abertas\n"
+        m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    m += "⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n"
+    m += "✅ Clica nos BOTÕES para interagir\n"
+    
+    # Botões do menu principal
     buttons = [
-        [{"text": "50 h", "callback_data": "50_h"}],
-        [{"text": "50", "callback_data": "50_normal"}, {"text": "Não", "callback_data": "nao"}]
+        [
+            {"text": "📊 Dashboard", "callback_data": "menu_dashboard"},
+            {"text": "💼 Posições", "callback_data": "menu_posicoes"}
+        ],
+        [
+            {"text": "💰 Saldo", "callback_data": "menu_saldo"},
+            {"text": "📈 Ganhos", "callback_data": "menu_ganhos"}
+        ],
+        [
+            {"text": "📋 Stats", "callback_data": "menu_stats"},
+            {"text": "🛑 Fechar", "callback_data": "menu_fechar"}
+        ],
+        [
+            {"text": "🧪 Teste", "callback_data": "menu_teste"},
+            {"text": "ℹ️ Ajuda", "callback_data": "menu_ajuda"}
+        ]
     ]
-    """
-    try:
-        payload = {
-            "chat_id": CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-            "reply_markup": {
-                "inline_keyboard": buttons
-            }
-        }
-        requests.post(f"{API}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        print(f"Erro telegram buttons: {e}")
+    
+    send_with_buttons(m, buttons)
 
 def send_photo(buf, caption):
     try:
@@ -686,7 +746,45 @@ def mostrar_posicoes():
         m+=f"━━━━━━\n{arrow} <b>{sym}</b>\n💰 ${upl:+.4f} ({roe:+.1f}%)"
     send(m)
 
+def mostrar_lista_fechar():
+    """Mostra lista de posições para fechar com botões"""
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", 
+                     {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    pos = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0] if resp.get("code") == "00000" else []
+    
+    if not pos:
+        send("📭 Sem posições abertas para fechar")
+        return
+    
+    m = f"🛑 <b>FECHAR POSIÇÃO</b>\n━━━━━━━━━━━━━━━\n"
+    buttons = []
+    
+    for i, p in enumerate(pos, 1):
+        sym = p.get("symbol","?")
+        side = p.get("holdSide","?")
+        upl = float(p.get("unrealizedPL",0))
+        marg = float(p.get("marginSize",0))
+        roe = (upl/marg*100) if marg else 0
+        arrow = "↑" if side=="long" else "↓"
+        emoji_ganho = "🟢" if upl >= 0 else "🔴"
+        
+        m += f"{i}️⃣ {arrow} <b>{sym}</b> {emoji_ganho} ${upl:+.2f} ({roe:+.1f}%)\n"
+        
+        # Botão para fechar cada posição
+        buttons.append([{
+            "text": f"✅ Fechar {i}",
+            "callback_data": f"fechar_{sym}"
+        }])
+    
+    m += "━━━━━━━━━━━━━━━\nClica para fechar:"
+    
+    # Botão voltar
+    buttons.append([{"text": "↩️ Voltar", "callback_data": "voltar_menu"}])
+    
+    send_with_buttons(m, buttons)
+
 def fechar_posicao(symbol):
+    """Fecha posição e mostra resultado com % de ganho"""
     symbol = symbol.upper()
     if not symbol.endswith("USDT"): symbol += "USDT"
     
@@ -698,9 +796,12 @@ def fechar_posicao(symbol):
         if p.get("symbol")==symbol and float(p.get("total",0))>0:
             pos = p; break
     if not pos: 
-        send(f"📭 Sem posição em {symbol}"); return
+        send(f"📭 Sem posição em {symbol}")
+        return
     
     upl = float(pos.get("unrealizedPL",0))
+    marg = float(pos.get("marginSize",0))
+    pct = (upl/marg*100) if marg else 0
     
     # 2. Cancela TODAS as ordens PRIMEIRO
     print(f"⏳ Cancelando ordens de {symbol}...")
@@ -714,15 +815,23 @@ def fechar_posicao(symbol):
     print(f"Close response: {close_r}")
     time.sleep(1)
     
-    # 4. Cancela NOVAMENTE (por segurança) — mata qualquer ordem órfã
+    # 4. Cancela NOVAMENTE (por segurança)
     print(f"⏳ Verificando limpeza final de {symbol}...")
     cancel_r2 = bg_cancel_all(symbol)
     print(f"Cancel 2 response: {cancel_r2}")
     time.sleep(0.5)
     
     if close_r.get("code")=="00000":
-        send(f"✅ <b>{symbol}</b> fechada com sucesso!\n💰 L/P: ${upl:+.4f}\n✔️ Todas as ordens (SL/TP/Trailing) canceladas")
+        emoji = "🟢" if upl >= 0 else "🔴"
+        sinal = "+" if upl >= 0 else ""
+        m = f"{emoji} <b>POSIÇÃO FECHADA</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"<b>{symbol}</b>\n"
+        m += f"💰 Resultado: <b>${sinal}{upl:+.4f}</b>\n"
+        m += f"📊 ROE: <b>{sinal}{pct:.2f}%</b>\n"
+        m += f"✔️ Todas as ordens (SL/TP/Trailing) canceladas"
+        send(m)
         posicoes_abertas_cache.pop(symbol, None)
+        mostrar_dashboard_startup()  # Mostra dashboard atualizado
     else: 
         send(f"❌ Erro ao fechar: {close_r.get('msg','?')}")
 
@@ -862,7 +971,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+mostrar_dashboard_startup()
 
 while True:
     process_replies()
