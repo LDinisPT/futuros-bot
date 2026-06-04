@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.6"
+VERSAO = "v5.7"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -656,54 +656,7 @@ def forcar_teste(symbol):
     except Exception as e:
         send(f"⚠️ Erro: {e}")
 
-def mostrar_dashboard():
-    """Mostra dashboard com saldo e posições"""
-    resp_acc = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
-    if resp_acc.get("code") != "00000":
-        send(f"⚠️ Erro ao carregar saldo"); return
-    
-    data = resp_acc.get("data", [])
-    if not data:
-        send("📭 Sem dados"); return
-    
-    a = data[0]
-    equity = float(a.get("accountEquity", 0))
-    avail = float(a.get("available", 0))
-    upl = float(a.get("unrealizedPL", 0))
-    perda = perda_hoje()
-    
-    m = f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n"
-    m += f"💵 REAL | ⚡ Máx 3x\n"
-    m += "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    m += f"💰 <b>SALDO</b>\n"
-    m += f"💵 Total: <b>${equity:.2f}</b>\n"
-    m += f"✅ Disponível: ${avail:.2f}\n"
-    m += f"📊 L/P aberto: <b>${upl:+.2f}</b>\n"
-    m += f"📅 L/P hoje: <b>${perda:+.2f}</b>\n"
-    m += "━━━━━━━━━━━━━━━━━━━━━\n\n"
-    
-    resp_pos = bg_request("GET", "/api/v2/mix/position/all-position", 
-                         {"productType":"USDT-FUTURES","marginCoin":"USDT"})
-    pos = [p for p in resp_pos.get("data", []) if float(p.get("total",0)) > 0] if resp_pos.get("code") == "00000" else []
-    
-    if pos:
-        m += f"📊 <b>POSIÇÕES ({len(pos)})</b>\n"
-        for i, p in enumerate(pos, 1):
-            sym = p.get("symbol","?")
-            side = p.get("holdSide","?")
-            upl_pos = float(p.get("unrealizedPL",0))
-            marg = float(p.get("marginSize",0))
-            roe = (upl_pos/marg*100) if marg else 0
-            arrow = "↑" if side=="long" else "↓"
-            emoji = "🟢" if upl_pos >= 0 else "🔴"
-            m += f"{i}️⃣ {arrow} {sym} {emoji} ${upl_pos:+.2f} ({roe:+.1f}%)\n"
-    else:
-        m += "📭 Sem posições\n"
-    
-    m += "━━━━━━━━━━━━━━━━━━━━━\n"
-    m += "⚡ AUTOMÁTICO: Score ≥ 6\n"
-    m += "✅ Clica nos BOTÕES\n"
-    send(m)
+def mostrar_saldo():
     resp = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
     if resp.get("code") != "00000": send(f"⚠️ Erro"); return
     data = resp.get("data", [])
@@ -733,94 +686,45 @@ def mostrar_posicoes():
         m+=f"━━━━━━\n{arrow} <b>{sym}</b>\n💰 ${upl:+.4f} ({roe:+.1f}%)"
     send(m)
 
-def menu_fechar():
-    """Menu para fechar posições com botões"""
+def fechar_posicao(symbol):
+    symbol = symbol.upper()
+    if not symbol.endswith("USDT"): symbol += "USDT"
+    
+    # 1. Valida posição
     resp = bg_request("GET", "/api/v2/mix/position/all-position", 
                      {"productType":"USDT-FUTURES","marginCoin":"USDT"})
-    
-    if resp.get("code") != "00000":
-        send("⚠️ Erro ao carregar posições"); return
-    
-    pos_list = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0]
-    
-    if not pos_list:
-        send("📭 Sem posições abertas para fechar"); return
-    
-    m = f"🛑 <b>FECHAR POSIÇÃO</b>\n━━━━━━━━━━━━━━━\n\n"
-    buttons = []
-    
-    for i, p in enumerate(pos_list, 1):
-        sym = p.get("symbol","?")
-        side = p.get("holdSide","?")
-        upl = float(p.get("unrealizedPL",0))
-        marg = float(p.get("marginSize",0))
-        roe = (upl/marg*100) if marg else 0
-        arrow = "↑" if side=="long" else "↓"
-        emoji = "🟢" if upl >= 0 else "🔴"
-        
-        m += f"{i}️⃣ {arrow} <b>{sym}</b>\n"
-        m += f"   {emoji} ${upl:+.4f} ({roe:+.1f}%)\n\n"
-        
-        # Botão para fechar
-        buttons.append([{
-            "text": f"✅ Fechar {i}",
-            "callback_data": f"fechar_{sym}"
-        }])
-    
-    m += "━━━━━━━━━━━━━━━\nEscolhe qual fechar:"
-    buttons.append([{"text": "↩️ Voltar", "callback_data": "voltar_menu"}])
-    
-    send_with_buttons(m, buttons)
-
-def fechar_posicao_callback(symbol):
-    """Fecha posição após escolher no menu"""
-    symbol = symbol.upper().strip()
-    
-    if not symbol.endswith("USDT"):
-        symbol = symbol + "USDT"
-    
-    resp = bg_request("GET", "/api/v2/mix/position/all-position", 
-                     {"productType":"USDT-FUTURES","marginCoin":"USDT"})
-    if resp.get("code") != "00000":
-        send(f"⚠️ Erro ao verificar posições"); return
-    
     pos = None
     for p in resp.get("data", []):
-        if p.get("symbol") == symbol and float(p.get("total",0)) > 0:
-            pos = p
-            break
-    
+        if p.get("symbol")==symbol and float(p.get("total",0))>0:
+            pos = p; break
     if not pos: 
-        send(f"📭 Posição {symbol} não encontrada"); return
+        send(f"📭 Sem posição em {symbol}"); return
     
     upl = float(pos.get("unrealizedPL",0))
-    marg = float(pos.get("marginSize",0))
-    pct = (upl/marg*100) if marg else 0
     
-    print(f"⏳ Fechando {symbol}...")
+    # 2. Cancela TODAS as ordens PRIMEIRO
+    print(f"⏳ Cancelando ordens de {symbol}...")
     cancel_r = bg_cancel_all(symbol)
+    print(f"Cancel 1 response: {cancel_r}")
     time.sleep(1)
     
+    # 3. DEPOIS fecha a posição
+    print(f"⏳ Fechando posição de {symbol}...")
     close_r = bg_close_position(symbol)
+    print(f"Close response: {close_r}")
     time.sleep(1)
     
+    # 4. Cancela NOVAMENTE (por segurança) — mata qualquer ordem órfã
+    print(f"⏳ Verificando limpeza final de {symbol}...")
     cancel_r2 = bg_cancel_all(symbol)
+    print(f"Cancel 2 response: {cancel_r2}")
     time.sleep(0.5)
     
     if close_r.get("code")=="00000":
-        emoji = "🟢" if upl >= 0 else "🔴"
-        sinal = "+" if upl >= 0 else ""
-        m = f"{emoji} <b>POSIÇÃO FECHADA</b>\n━━━━━━━━━━━━━━━\n"
-        m += f"<b>{symbol}</b>\n"
-        m += f"💰 Resultado: <b>${sinal}{upl:+.4f}</b>\n"
-        m += f"📊 ROE: <b>{sinal}{pct:.2f}%</b>\n"
-        m += f"✔️ Todas as ordens canceladas"
-        send(m)
+        send(f"✅ <b>{symbol}</b> fechada com sucesso!\n💰 L/P: ${upl:+.4f}\n✔️ Todas as ordens (SL/TP/Trailing) canceladas")
         posicoes_abertas_cache.pop(symbol, None)
-        time.sleep(1)
-        mostrar_dashboard()
     else: 
-        send(f"❌ Erro: {close_r.get('msg','?')}")
+        send(f"❌ Erro ao fechar: {close_r.get('msg','?')}")
 
 def mostrar_ganhos():
     resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
@@ -901,6 +805,92 @@ def mostrar_ajuda():
     m += f"⏰ Análise: a cada 15 min"
     send(m)
 
+def menu_fechar():
+    """Menu para fechar posições com botões"""
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", 
+                     {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    
+    if resp.get("code") != "00000":
+        send("⚠️ Erro ao carregar posições"); return
+    
+    pos_list = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0]
+    
+    if not pos_list:
+        send("📭 Sem posições abertas para fechar"); return
+    
+    m = f"🛑 <b>FECHAR POSIÇÃO</b>\n━━━━━━━━━━━━━━━\n\n"
+    buttons = []
+    
+    for i, p in enumerate(pos_list, 1):
+        sym = p.get("symbol","?")
+        side = p.get("holdSide","?")
+        upl = float(p.get("unrealizedPL",0))
+        marg = float(p.get("marginSize",0))
+        roe = (upl/marg*100) if marg else 0
+        arrow = "↑" if side=="long" else "↓"
+        emoji = "🟢" if upl >= 0 else "🔴"
+        
+        m += f"{i}️⃣ {arrow} <b>{sym}</b>\n"
+        m += f"   {emoji} ${upl:+.4f} ({roe:+.1f}%)\n\n"
+        
+        buttons.append([{
+            "text": f"✅ Fechar {i}",
+            "callback_data": f"fechar_{sym}"
+        }])
+    
+    m += "━━━━━━━━━━━━━━━\nEscolhe qual fechar:"
+    buttons.append([{"text": "↩️ Voltar", "callback_data": "voltar_menu"}])
+    
+    send_with_buttons(m, buttons)
+
+def fechar_posicao_callback(symbol):
+    """Fecha posição após escolher no menu"""
+    symbol = symbol.upper().strip()
+    
+    if not symbol.endswith("USDT"):
+        symbol = symbol + "USDT"
+    
+    resp = bg_request("GET", "/api/v2/mix/position/all-position", 
+                     {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    if resp.get("code") != "00000":
+        send(f"⚠️ Erro ao verificar posições"); return
+    
+    pos = None
+    for p in resp.get("data", []):
+        if p.get("symbol") == symbol and float(p.get("total",0)) > 0:
+            pos = p
+            break
+    
+    if not pos: 
+        send(f"📭 Posição {symbol} não encontrada"); return
+    
+    upl = float(pos.get("unrealizedPL",0))
+    marg = float(pos.get("marginSize",0))
+    pct = (upl/marg*100) if marg else 0
+    
+    print(f"⏳ Fechando {symbol}...")
+    cancel_r = bg_cancel_all(symbol)
+    time.sleep(1)
+    
+    close_r = bg_close_position(symbol)
+    time.sleep(1)
+    
+    cancel_r2 = bg_cancel_all(symbol)
+    time.sleep(0.5)
+    
+    if close_r.get("code")=="00000":
+        emoji = "🟢" if upl >= 0 else "🔴"
+        sinal = "+" if upl >= 0 else ""
+        m = f"{emoji} <b>POSIÇÃO FECHADA</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"<b>{symbol}</b>\n"
+        m += f"💰 Resultado: <b>${sinal}{upl:+.4f}</b>\n"
+        m += f"📊 ROE: <b>{sinal}{pct:.2f}%</b>\n"
+        m += f"✔️ Todas as ordens canceladas"
+        send(m)
+        posicoes_abertas_cache.pop(symbol, None)
+    else: 
+        send(f"❌ Erro: {close_r.get('msg','?')}")
+
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -910,12 +900,10 @@ def process_replies():
         if "callback_query" in u:
             callback = u["callback_query"]
             callback_data = callback.get("data", "")
-            callback_msg_id = callback.get("message", {}).get("message_id")
             
             if callback_data.startswith("fechar_"):
                 symbol = callback_data.replace("fechar_", "")
                 fechar_posicao_callback(symbol)
-                continue
             continue
         
         text = u.get("message",{}).get("text","").strip().lower()
@@ -970,7 +958,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-mostrar_dashboard()
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
 while True:
     process_replies()
