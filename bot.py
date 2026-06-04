@@ -733,10 +733,10 @@ def mostrar_ajuda():
     m += "/saldo /posicoes /ganhos /stats\n"
     m += "/fechar SOL /teste LTC /ajuda\n━━━━━━━━━━━━━━━\n"
     m += "<b>Ao receber sinal:</b>\n"
-    m += "<b>s 50 h</b> → $50, hibrido (RECOMENDADO)\n"
-    m += "<b>s 50</b> → $50, normal\n"
-    m += "<b>s 50 t</b> → $50, trailing\n"
-    m += "<b>s r1 h</b> → $1 risco, hibrido\n"
+    m += "<b>50 h</b> → $50, hibrido (RECOMENDADO)\n"
+    m += "<b>50</b> → $50, normal\n"
+    m += "<b>50 t</b> → $50, trailing\n"
+    m += "<b>r1 h</b> → $1 risco, hibrido\n"
     m += "<b>não</b> → ignora sinal\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += f"⚠️ Aviso perda: ${DAILY_LOSS_WARNING}\n"
@@ -764,16 +764,16 @@ def process_replies():
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
             send("❌ Cancelado"); pending.pop(CHAT_ID, None); continue
-        if text.startswith("sim") or text.startswith("s "):
+        # Parser: aceita "50 h", "sim 50 h", "20", "r1 h", etc
+        if any(text[0].isdigit() for _ in [0]) or text.startswith("sim") or text.startswith("r"):
             has_conf = "confirmar" in text
             
-            # Atalhos simplificados
-            text = text.replace("s h", "sim hibrido").replace("s t", "sim trail")
-            
+            # Remove "sim" se existir
             t_limpo = text.replace("sim","").replace("confirmar","").strip()
             partes = t_limpo.split()
+            
             if not partes:
-                send("⚠️ Formato: s 50 h / s 20 / s r1 h\n✅ s = sim, h = hibrido, t = trail"); continue
+                send("⚠️ Formato: 50 h / 20 / r1 h\n✅ h = hibrido, t = trail"); continue
             try:
                 primeiro = partes[0]
                 if primeiro.startswith("r") and len(primeiro)>1:
@@ -801,7 +801,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n✅ Atalhos: s 50 h (hibrido), s 20, s r1 h\nEscreve /ajuda")
+send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n✅ Atalhos: 50 h (hibrido), 20, r1 h\nEscreve /ajuda")
 
 while True:
     process_replies()
