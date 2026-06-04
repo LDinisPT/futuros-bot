@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.3.2"
+VERSAO = "v5.4"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
@@ -544,32 +544,53 @@ def analyze():
                 if score > 0: score += inside_bar; reasons.append("Consolidação bullish")
                 elif score < 0: score += inside_bar; reasons.append("Consolidação bearish")
             
-            if score>=4:
-                signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
+            if score>=6:
+                # AUTOMÁTICO! Score muito forte
+                signals.append(((sym,price,0,r,"🟢 LONG MUITO FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
+            elif score<=-6:
+                # AUTOMÁTICO! Score muito forte negativo
+                signals.append(((sym,price,0,r,"🔴 SHORT MUITO FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
+            elif score>=4:
+                signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
             elif score<=-4:
-                signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym))
+                signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
             print(f"{sym}: RSI={r} score={score} funding={funding:+.3%}")
             time.sleep(0.6)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
 
-def enviar_sinal(sig, ohlc, e20, e50, bgsym):
+def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
     sym,price,_,rsi_v,label,score,reasons,atr_val = sig
     sl,tp1,tp2,_ = calc_levels(price,label,atr_val)
     dist_pct = abs(sl-price)/price*100
-    risco_5m = 5 * 3 * dist_pct/100
-    cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
-    cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
-    cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons[:3])}\n━━━━━━━━━━━━━━━\n"
-    cap += f"💰 <b>ENTRAR?</b>\n"
-    cap += f"✅ <b>sim 5</b> → $5 margem (risco ~${risco_5m:.2f})\n"
-    cap += f"✅ <b>sim r1</b> → arrisca $1 no SL\n"
-    cap += f"➕ <b>trail</b> ou <b>hibrido</b>\n❌ <b>não</b>"
-    pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
-    buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
-    if buf: send_photo(buf, cap)
-    else: send(cap)
+    
+    if tipo == "AUTO":
+        # ENTRADA AUTOMÁTICA (score >= 6)
+        cap  = f"⚡ <b>ENTRADA AUTOMÁTICA!</b>\n{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
+        cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
+        cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons[:2])}\n"
+        cap += f"━━━━━━━━━━━━━━━\n✅ Bot entrou com $50 hibrido!"
+        pending[CHAT_ID] = None
+        buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
+        if buf: send_photo(buf, cap)
+        else: send(cap)
+        # Executa automático
+        executar_trade(sig, bgsym, 50, "hibrido", "margem")
+    else:
+        # ENTRADA MANUAL (score 4-5 ou -4 a -5)
+        risco_5m = 5 * 3 * dist_pct/100
+        cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
+        cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
+        cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons[:3])}\n━━━━━━━━━━━━━━━\n"
+        cap += f"💰 <b>ENTRAR?</b>\n"
+        cap += f"✅ <b>50 h</b> → $50, hibrido\n"
+        cap += f"✅ <b>50</b> → $50, normal\n"
+        cap += f"➕ <b>50 t</b> → trailing\n❌ <b>não</b>"
+        pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
+        buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
+        if buf: send_photo(buf, cap)
+        else: send(cap)
 
 def forcar_teste(symbol):
     symbol = symbol.upper()
@@ -732,12 +753,15 @@ def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
     m += "/saldo /posicoes /ganhos /stats\n"
     m += "/fechar SOL /teste LTC /ajuda\n━━━━━━━━━━━━━━━\n"
-    m += "<b>Ao receber sinal:</b>\n"
-    m += "<b>50 h</b> → $50, hibrido (RECOMENDADO)\n"
+    m += "<b>⚡ AUTOMÁTICO (Score ≥ 6):</b>\n"
+    m += "Bot entra $50 hibrido sozinho!\n"
+    m += "━━━━━━━━━━━━━━━\n"
+    m += "<b>Manual (Score 4-5):</b>\n"
+    m += "<b>50 h</b> → $50, hibrido\n"
     m += "<b>50</b> → $50, normal\n"
     m += "<b>50 t</b> → $50, trailing\n"
-    m += "<b>r1 h</b> → $1 risco, hibrido\n"
-    m += "<b>não</b> → ignora sinal\n"
+    m += "<b>r1 h</b> → $1 risco\n"
+    m += "<b>não</b> → ignora\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += f"⚠️ Aviso perda: ${DAILY_LOSS_WARNING}\n"
     m += f"📏 Limite: ${MAX_NOTIONAL}\n"
@@ -801,7 +825,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n✅ Atalhos: 50 h (hibrido), 20, r1 h\nEscreve /ajuda")
+send(f"🤖 <b>FuturesScan Bot {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ <b>AUTOMÁTICO: Score ≥ 6 entra $50 hibrido sozinho!</b>\n✅ Manual: Score 4-5 pede confirmação\nEscreve /ajuda")
 
 while True:
     process_replies()
@@ -811,7 +835,9 @@ while True:
         try:
             signals = analyze()
             for item in signals:
-                enviar_sinal(*item); break
+                sig, ohlc, e20, e50, bgsym, tipo = item
+                enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo)
+                break
             if not signals: print("Sem sinais fortes.")
         except Exception as e:
             print(f"Erro: {e}")
