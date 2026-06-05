@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.8"
+VERSAO = "v5.9"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -543,76 +543,121 @@ def analyze():
             rejection = detect_rejection(ohlc)
             inside_bar = detect_inside_bar(ohlc)
             
-            score=0; reasons=[]
-            if r<30: score+=3; reasons.append("RSI sobrevendido")
-            elif r<40: score+=1
-            elif r>70: score-=3; reasons.append("RSI sobrecomprado")
-            elif r>60: score-=1
-            if bull: score+=2; reasons.append("EMA bullish")
-            else: score-=2; reasons.append("EMA bearish")
-            if ml>sl_ and hist>0: score+=2; reasons.append("MACD bullish")
-            elif ml<sl_ and hist<0: score-=2; reasons.append("MACD bearish")
-            if vol_ratio > 1.3 and score>0: score+=1; reasons.append("Volume↑")
-            elif vol_ratio < 0.6: score = int(score * 0.7); reasons.append("Volume baixo")
+            score=0.0; score_breakdown={}; reasons=[]
             
-            # Funding Rate impact
+            # RSI (0 a ±3)
+            rsi_score = 0.0
+            if r<30: rsi_score=3.0; reasons.append("RSI sobrevendido")
+            elif r<40: rsi_score=1.5
+            elif r>70: rsi_score=-3.0; reasons.append("RSI sobrecomprado")
+            elif r>60: rsi_score=-1.5
+            score += rsi_score
+            score_breakdown['RSI'] = rsi_score
+            
+            # EMA (0 a ±2)
+            ema_score = 0.0
+            if bull: ema_score=2.0; reasons.append("EMA bullish")
+            else: ema_score=-2.0; reasons.append("EMA bearish")
+            score += ema_score
+            score_breakdown['EMA'] = ema_score
+            
+            # MACD (0 a ±2)
+            macd_score = 0.0
+            if ml>sl_ and hist>0: macd_score=2.0; reasons.append("MACD bullish")
+            elif ml<sl_ and hist<0: macd_score=-2.0; reasons.append("MACD bearish")
+            score += macd_score
+            score_breakdown['MACD'] = macd_score
+            
+            # Volume (0 a ±1)
+            vol_score = 0.0
+            if vol_ratio > 1.3 and score>0: vol_score=1.0; reasons.append("Volume↑")
+            elif vol_ratio < 0.6: vol_score=-0.5; reasons.append("Volume baixo")
+            score += vol_score
+            score_breakdown['Volume'] = vol_score
+            
+            # Funding Rate (0 a ±1)
+            funding_score = 0.0
             if score > 0 and funding > 0.03:
-                score -= 1; reasons.append(f"Funding alto ({funding:+.3%})")
+                funding_score -= 1.0; reasons.append(f"Funding alto ({funding:+.3%})")
             elif score < 0 and funding < -0.03:
-                score += 1; reasons.append(f"Funding baixo ({funding:+.3%})")
+                funding_score += 1.0; reasons.append(f"Funding baixo ({funding:+.3%})")
+            score += funding_score
+            score_breakdown['Funding'] = funding_score
             
-            # Candlestick Patterns
+            # Candlestick Patterns (0 a ±2.5)
+            pattern_score = 0.0
             if engulfing > 0 and score > 0:
-                score += engulfing; reasons.append("Engulfing bullish ✅")
+                pattern_score += engulfing; reasons.append("Engulfing bullish ✅")
             elif engulfing < 0 and score < 0:
-                score += engulfing; reasons.append("Engulfing bearish ✅")
+                pattern_score += engulfing; reasons.append("Engulfing bearish ✅")
             
             if rejection != 0:
-                score += rejection; reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
+                pattern_score += rejection; reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
             
             if inside_bar > 0:
-                if score > 0: score += inside_bar; reasons.append("Consolidação bullish")
-                elif score < 0: score += inside_bar; reasons.append("Consolidação bearish")
+                if score > 0: pattern_score += inside_bar; reasons.append("Consolidação bullish")
+                elif score < 0: pattern_score += inside_bar; reasons.append("Consolidação bearish")
             
-            if score>=6:
+            score += pattern_score
+            score_breakdown['Padrões'] = pattern_score
+            
+            # Arredondar score para 1 decimal
+            score = round(score, 1)
+            
+            if score>=6.0:
                 # AUTOMÁTICO! Score muito forte
-                signals.append(((sym,price,0,r,"🟢 LONG MUITO FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
-            elif score<=-6:
+                signals.append(((sym,price,0,r,"🟢 LONG MUITO FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
+            elif score<=-6.0:
                 # AUTOMÁTICO! Score muito forte negativo
-                signals.append(((sym,price,0,r,"🔴 SHORT MUITO FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
-            elif score>=4:
-                signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
-            elif score<=-4:
-                signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
-            print(f"{sym}: RSI={r} score={score} funding={funding:+.3%}")
+                signals.append(((sym,price,0,r,"🔴 SHORT MUITO FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
+            elif score>=4.0:
+                signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
+            elif score<=-4.0:
+                signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
+            print(f"{sym}: RSI={r} score={score:.1f} funding={funding:+.3%}")
             time.sleep(0.6)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
 
 def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
-    sym,price,_,rsi_v,label,score,reasons,atr_val = sig
+    sym,price,_,rsi_v,label,score,score_breakdown,reasons,atr_val = sig
     sl,tp1,tp2,_ = calc_levels(price,label,atr_val)
     dist_pct = abs(sl-price)/price*100
+    
+    # Calcular confiança baseado no score
+    confianca = min(95, 50 + (abs(score) * 10))
+    
+    # Breakdown string
+    breakdown_str = "Breakdown:\n"
+    for indicador, valor in score_breakdown.items():
+        sinal = "+" if valor >= 0 else ""
+        breakdown_str += f"  {indicador}: {sinal}{valor:.1f}\n"
     
     if tipo == "AUTO":
         # ENTRADA AUTOMÁTICA (score >= 6)
         cap  = f"⚡ <b>ENTRADA AUTOMÁTICA!</b>\n{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
         cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
-        cap += f"📉 RSI: {rsi_v} | Score: {score:+d}\n📌 {', '.join(reasons[:2])}\n"
+        cap += f"━━━━━━━━━━━━━━━\n"
+        cap += f"📉 RSI: {rsi_v} | <b>Score: {score:+.1f}</b> (Confiança: {confianca:.0f}%)\n"
+        cap += breakdown_str
+        cap += f"📌 {', '.join(reasons[:2])}\n"
         cap += f"━━━━━━━━━━━━━━━\n✅ Bot entrou com $50 hibrido!"
         pending[CHAT_ID] = None
         buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
         if buf: send_photo(buf, cap)
         else: send(cap)
         # Executa automático
-        executar_trade(sig, bgsym, 50, "hibrido", "margem")
+        executar_trade(sig, ohlc, e20, e50, bgsym, 50, "hibrido", "margem")
     else:
         # ENTRADA MANUAL (score 4-5 ou -4 a -5) COM BOTÕES
         cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
         cap += f"💲 Entrada: ${fmt(price)} | 📊 RSI: {rsi_v}\n"
-        cap += f"🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%) | Score: {score:+d}\n"
+        cap += f"🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n"
         cap += f"🎯 TP1: ${fmt(tp1)}\n"
+        cap += f"━━━━━━━━━━━━━━━\n"
+        cap += f"<b>Score: {score:+.1f}</b> (Confiança: {confianca:.0f}%)\n"
+        cap += breakdown_str
         cap += f"📌 {', '.join(reasons[:2])}"
         
         # Botões de resposta
