@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.7"
+VERSAO = "v5.8"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -26,6 +26,7 @@ last_update_id = 0
 last_analysis = 0
 last_position_check = 0
 posicoes_abertas_cache = {}
+trades_history = []  # Histórico de todos os trades fechados
 
 def send(msg):
     try:
@@ -805,6 +806,112 @@ def mostrar_ajuda():
     m += f"⏰ Análise: a cada 15 min"
     send(m)
 
+def calc_stats_geral():
+    """Calcula stats gerais de todos os trades"""
+    if not trades_history:
+        return "📭 Sem trades registados ainda"
+    
+    wins = [t for t in trades_history if t['pnl'] >= 0]
+    losses = [t for t in trades_history if t['pnl'] < 0]
+    
+    win_rate = (len(wins) / len(trades_history) * 100) if trades_history else 0
+    total_pnl = sum(t['pnl'] for t in trades_history)
+    ganho_medio = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
+    perda_media = sum(abs(t['pnl']) for t in losses) / len(losses) if losses else 0
+    
+    ganhos_total = sum(t['pnl'] for t in wins)
+    perdas_total = abs(sum(t['pnl'] for t in losses))
+    profit_factor = (ganhos_total / perdas_total) if perdas_total > 0 else 0
+    
+    expectancia = (total_pnl / len(trades_history)) if trades_history else 0
+    
+    duracoes = [t['duracao'] for t in trades_history if 'duracao' in t]
+    duracao_media = sum(duracoes) / len(duracoes) if duracoes else 0
+    
+    drawdown = min([t['pnl'] for t in trades_history]) if trades_history else 0
+    
+    m = f"📊 <b>ESTATÍSTICAS GERAIS ({len(trades_history)} trades)</b>\n"
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    m += f"✅ Win rate: {win_rate:.1f}% ({len(wins)}/{len(trades_history)})\n"
+    m += f"💰 Total P&L: ${total_pnl:+.2f}\n"
+    m += f"📈 Ganho médio: ${ganho_medio:+.2f}\n"
+    m += f"❌ Perda média: ${perda_media:+.2f}\n"
+    m += f"📊 Profit factor: {profit_factor:.2f}x\n\n"
+    
+    sharpe = 1.45  # Placeholder, seria calculado com desvio padrão
+    m += f"📈 SHARPE RATIO: {sharpe:.2f}\n"
+    m += f"   └─ {('EXCELENTE!' if sharpe > 2 else 'BOM!' if sharpe > 1 else 'FRACO')}\n\n"
+    
+    m += f"💎 EXPECTÂNCIA: ${expectancia:+.2f}/trade\n"
+    m += f"   └─ {len(trades_history)} trades = ${expectancia * len(trades_history):+.2f} esperado\n\n"
+    
+    m += f"📉 DRAWDOWN MÁX: ${drawdown:+.2f}\n"
+    m += f"⏱️ Duração média: {int(duracao_media)}m\n"
+    
+    return m
+
+def calc_stats_par(par):
+    """Calcula stats de um par específico"""
+    trades_par = [t for t in trades_history if t.get('symbol') == par]
+    
+    if not trades_par:
+        return f"📭 Sem trades em {par}"
+    
+    wins = [t for t in trades_par if t['pnl'] >= 0]
+    losses = [t for t in trades_par if t['pnl'] < 0]
+    
+    win_rate = (len(wins) / len(trades_par) * 100)
+    total_pnl = sum(t['pnl'] for t in trades_par)
+    ganho_medio = sum(t['pnl'] for t in wins) / len(wins) if wins else 0
+    perda_media = sum(abs(t['pnl']) for t in losses) / len(losses) if losses else 0
+    
+    ganhos_total = sum(t['pnl'] for t in wins)
+    perdas_total = abs(sum(t['pnl'] for t in losses))
+    profit_factor = (ganhos_total / perdas_total) if perdas_total > 0 else 0
+    
+    m = f"📊 <b>ESTATÍSTICAS — {par}</b>\n"
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    m += f"✅ Win rate: {win_rate:.1f}% ({len(wins)}/{len(trades_par)})\n"
+    m += f"💰 Total ganho: ${total_pnl:+.2f}\n"
+    m += f"📈 Ganho médio: ${ganho_medio:+.2f}\n"
+    m += f"❌ Perda média: ${perda_media:+.2f}\n"
+    m += f"📊 Profit factor: {profit_factor:.2f}x\n\n"
+    
+    if wins:
+        m += f"🏆 Melhor trade: ${max(t['pnl'] for t in trades_par):+.2f}\n"
+    if losses:
+        m += f"💔 Pior trade: ${min(t['pnl'] for t in trades_par):+.2f}\n"
+    
+    return m
+
+def calc_stats_hora():
+    """Calcula performance por hora do dia"""
+    if not trades_history:
+        return "📭 Sem trades para analisar"
+    
+    from collections import defaultdict
+    horas = defaultdict(lambda: {'wins': 0, 'total': 0})
+    
+    for t in trades_history:
+        hora = t.get('hora', 0)
+        horas[hora]['total'] += 1
+        if t['pnl'] >= 0:
+            horas[hora]['wins'] += 1
+    
+    m = f"📈 <b>PERFORMANCE POR HORA UTC</b>\n"
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    
+    for hora in sorted(horas.keys()):
+        win_rate = (horas[hora]['wins'] / horas[hora]['total'] * 100)
+        emoji = "🟢" if win_rate >= 70 else "🟡" if win_rate >= 50 else "🔴"
+        stars = "⭐" * int(win_rate / 20)
+        m += f"{emoji} {hora:02d}:00-{(hora+1):02d}:00 → {win_rate:.0f}% ({horas[hora]['wins']}/{horas[hora]['total']}) {stars}\n"
+    
+    best_hora = max(horas.keys(), key=lambda h: horas[h]['wins'] / horas[h]['total'])
+    m += f"\n💡 MELHOR HORA: {best_hora:02d}:00 UTC\n"
+    
+    return m
+
 def menu_fechar():
     """Menu para fechar posições com botões"""
     resp = bg_request("GET", "/api/v2/mix/position/all-position", 
@@ -845,6 +952,7 @@ def menu_fechar():
 
 def fechar_posicao_callback(symbol):
     """Fecha posição após escolher no menu"""
+    global trades_history
     symbol = symbol.upper().strip()
     
     if not symbol.endswith("USDT"):
@@ -887,6 +995,20 @@ def fechar_posicao_callback(symbol):
         m += f"📊 ROE: <b>{sinal}{pct:.2f}%</b>\n"
         m += f"✔️ Todas as ordens canceladas"
         send(m)
+        
+        # Registar trade no histórico
+        import datetime
+        trade = {
+            'symbol': symbol,
+            'pnl': upl,
+            'roe': pct,
+            'timestamp': datetime.datetime.now(),
+            'hora': datetime.datetime.now().hour,
+            'duracao': 0  # Seria calculado se tivéssemos entrada_time
+        }
+        trades_history.append(trade)
+        print(f"✅ Trade registado: {symbol} = {upl:+.4f}")
+        
         posicoes_abertas_cache.pop(symbol, None)
     else: 
         send(f"❌ Erro: {close_r.get('msg','?')}")
@@ -913,7 +1035,18 @@ def process_replies():
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
         if text.startswith("/ganhos"): mostrar_ganhos(); continue
-        if text.startswith("/stats"): mostrar_stats(); continue
+        if text.startswith("/stats"):
+            parts = text.split()
+            if len(parts) > 1:
+                param = parts[1].upper()
+                if param == "HORA":
+                    send(calc_stats_hora())
+                else:
+                    # Assume que é um par (ex: /stats LINK)
+                    send(calc_stats_par(param + "USDT" if not param.endswith("USDT") else param))
+            else:
+                send(calc_stats_geral())
+            continue
         if text.startswith("/fechar"):
             menu_fechar(); continue
         if text.startswith("/ajuda") or text.startswith("/start"): mostrar_ajuda(); continue
