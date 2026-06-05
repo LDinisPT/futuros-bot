@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.9"
+VERSAO = "v5.10"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -225,7 +225,7 @@ def bg_cancel_all(symbol):
 
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
-    sl_m, tp1_m, tp2_m = 1.8, 2.8, 5.0
+    sl_m, tp1_m, tp2_m = 1.2, 2.8, 5.0  # SL mudado de 1.8 para 1.2
     if "LONG" in signal:
         return price - atr_val*sl_m, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
     return price + atr_val*sl_m, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
