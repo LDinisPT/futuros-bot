@@ -271,12 +271,17 @@ def count_trades_hoje():
             count += 1
     return count
 
-def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
+def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem", alavancagem_custom=None):
     sym, price, _, rsi_v, label, score, reasons, atr_val = sig
     is_long = "LONG" in label
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
     sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
-    lev = min(alav, MAX_LEV)
+    
+    # Usa alavancagem customizada se fornecida
+    if alavancagem_custom is not None:
+        lev = min(alavancagem_custom, 125)  # Máx 125x na Bitget
+    else:
+        lev = min(alav, MAX_LEV)
 
     if tipo_valor == "risco":
         distancia = abs(sl - price)
@@ -1292,14 +1297,20 @@ def process_replies():
             if callback_data.startswith("mt_confirmar"):
                 if CHAT_ID in manual_trade_state:
                     estado = manual_trade_state[CHAT_ID]
-                    # Executa trade
-                    send("⏳ Abrindo posição...")
-                    # Chama executar_trade com os parâmetros
-                    sig = (estado['par'].replace("USDT", ""), estado['price'], 0, 0, 
-                           f"{'🟢 LONG MANUAL' if estado['side'] == 'LONG' else '🔴 SHORT MANUAL'}",
-                           0, {}, [], 0)
-                    # TODO: Integrar com executar_trade
-                    send(f"✅ Posição aberta!\n{estado['par']} {estado['side']}")
+                    
+                    # Cria sig no formato correto para executar_trade
+                    par_curto = estado['par'].replace("USDT", "")
+                    label = f"🟢 LONG MANUAL" if estado['side'] == 'LONG' else f"🔴 SHORT MANUAL"
+                    
+                    sig = (par_curto, estado['price'], 0, 0, label, 0, {}, [], 0)
+                    
+                    # Executa com os parâmetros: margem, alavancagem, modo híbrido
+                    send(f"⏳ Abrindo posição {estado['par']} {estado['side']}...")
+                    time.sleep(0.5)
+                    
+                    # Chama executar_trade passando alavancagem customizada
+                    executar_trade(sig, estado['par'], estado['margem'], "hibrido", "margem", estado['alavancagem'])
+                    
                     manual_trade_state.pop(CHAT_ID, None)
                 continue
             
