@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.12"
+VERSAO = "v5.11"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -26,8 +26,7 @@ last_update_id = 0
 last_analysis = 0
 last_position_check = 0
 posicoes_abertas_cache = {}
-trades_history = []
-mt_state = {}
+trades_history = []  # Histórico de todos os trades fechados
 
 def send(msg):
     try:
@@ -1123,152 +1122,6 @@ def fechar_posicao_callback(symbol):
     else: 
         send(f"❌ Erro: {close_r.get('msg','?')}")
 
-def mt_start():
-    send("📊 <b>MANUAL TRADE</b>\n━━━━━\n\n🔤 PAR? (BTC, ETH, SOL...)")
-    mt_state[CHAT_ID] = {'step': 1}
-
-def mt_input(txt):
-    if CHAT_ID not in mt_state: return False
-    s = mt_state[CHAT_ID]
-    
-    if s['step'] == 1:  # PAR
-        p = txt.upper().strip()
-        if not p.endswith("USDT"): p += "USDT"
-        if p not in ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOTUSDT","LINKUSDT","UNIUSDT","ATOMUSDT","LTCUSDT","DOGEUSDT","AAVEUSDT"]:
-            send("❌ Inválido"); return True
-        s['par'] = p
-        s['step'] = 2
-        send(f"✅ {p}\n\nL ou S?")
-        return True
-    
-    if s['step'] == 2:  # L/S
-        side = txt.upper().strip()
-        if side not in ['L','S']:
-            send("❌ L ou S"); return True
-        s['side'] = 'LONG' if side=='L' else 'SHORT'
-        s['step'] = 3
-        send(f"✅ {s['side']}\n\nMargem? (50, 100...)")
-        return True
-    
-    if s['step'] == 3:  # Margem
-        try:
-            m = float(txt)
-            if m <= 0: send("❌ >0"); return True
-            s['m'] = m
-            s['step'] = 4
-            send(f"✅ ${m}\n\nAlav? (2,3,5,10...)")
-            return True
-        except:
-            send("❌ Número"); return True
-    
-    if s['step'] == 4:  # Alav
-        try:
-            a = float(txt)
-            if a <= 0 or a > 125: send("❌ 1-125"); return True
-            s['a'] = a
-            
-            not_val = s['m'] * a
-            if not_val > MAX_NOTIONAL:
-                send(f"❌ ${not_val:.0f} > ${MAX_NOTIONAL}")
-                mt_state.pop(CHAT_ID, None)
-                return True
-            
-            m = f"━━━━━━━━━━━━━━\n✅ <b>RESUMO</b>\n\n"
-            m += f"📊 {s['par']} {s['side']} (HÍBRIDO)\n"
-            m += f"💰 ${s['m']:.0f} | ⚡ {a:.1f}x | 📏 ${not_val:.0f}\n"
-            m += "━━━━━━━━━━━━━━\n⚠️ Entrar?"
-            
-            btns = [[{"text":"✅ SIM","callback_data":"mt_yes"}],[{"text":"❌ NÃO","callback_data":"mt_no"}]]
-            send_with_buttons(m, btns)
-            return True
-        except:
-            send("❌ Número"); return True
-    
-    return False
-
-def mt_open():
-    if CHAT_ID not in mt_state: return
-    s = mt_state[CHAT_ID]
-    
-    send(f"⏳ Abrindo {s['par']}...")
-    time.sleep(1)
-    
-    par = s['par']
-    is_long = s['side'] == 'LONG'
-    margem = s['m']
-    alav = s['a']
-    
-    try:
-        # Busca preço
-        pk = par.replace("USDT", "USD")
-        r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair":pk}, timeout=10).json()
-        price = float(r["result"][list(r["result"].keys())[0]]["c"][0])
-        
-        # Busca OHLC para ATR
-        r2 = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair":pk,"interval":60}, timeout=15).json()
-        ohlc = r2["result"][list(r2["result"].keys())[0]]
-        closes = [float(c[4]) for c in ohlc]
-        highs = [float(c[2]) for c in ohlc]
-        lows = [float(c[3]) for c in ohlc]
-        atr_val = atr(highs, lows, closes)
-        
-        # SL/TP
-        if is_long:
-            sl = price - (atr_val * 1.2)
-            tp = price + (atr_val * 2.8)
-        else:
-            sl = price + (atr_val * 1.2)
-            tp = price - (atr_val * 2.8)
-        
-        # Tamanho
-        not_val = margem * alav
-        size = not_val / price
-        
-        # Valida posição
-        if check_open_position(par):
-            send(f"⚠️ Já tem {par}"); 
-            mt_state.pop(CHAT_ID, None)
-            return
-        
-        # Set leverage
-        bg_set_leverage(par, alav)
-        time.sleep(1)
-        
-        # ABRE ORDEM
-        result = bg_place_order(par, is_long, size, sl, tp)
-        
-        if result.get("code") != "00000":
-            send(f"❌ Erro: {result.get('msg','?')}")
-            mt_state.pop(CHAT_ID, None)
-            return
-        
-        time.sleep(0.5)
-        
-        # Coloca trailing 50%
-        bg_place_trailing(par, is_long, size/2, tp, CALLBACK_RATIO)
-        
-        # Sucesso!
-        risco = abs(sl - price) * size
-        ganho = abs(tp - price) * size
-        
-        m = f"✅ <b>POSIÇÃO ABERTA!</b>\n━━━━━━━━━\n"
-        m += f"{'↑' if is_long else '↓'} {par} {s['side']} (HÍBRIDO)\n"
-        m += f"💲 ${price:,.2f}\n"
-        m += f"🛑 ${sl:,.2f} | 🎯 ${tp:,.2f}\n"
-        m += f"━━━━━━━━━\n"
-        m += f"⚡ {alav:.1f}x | 💰 ${margem:.0f}\n"
-        m += f"💔 Risco: ${risco:+.2f}\n"
-        m += f"💎 Ganho: ${ganho:+.2f}"
-        
-        send(m)
-        posicoes_abertas_cache[par] = {'entrada': price, 'tempo_abertura': time.time(), 'modo': 'hibrido', 'sym': par.replace("USDT",""), 'lado': s['side']}
-        
-    except Exception as e:
-        send(f"❌ Erro: {str(e)[:50]}")
-        print(f"MT Error: {e}")
-    
-    mt_state.pop(CHAT_ID, None)
-
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -1278,15 +1131,6 @@ def process_replies():
         if "callback_query" in u:
             callback = u["callback_query"]
             callback_data = callback.get("data", "")
-            
-            if callback_data == "mt_yes":
-                mt_open()
-                continue
-            
-            if callback_data == "mt_no":
-                send("❌ Cancelado")
-                mt_state.pop(CHAT_ID, None)
-                continue
             
             if callback_data.startswith("fechar_"):
                 symbol = callback_data.replace("fechar_", "")
@@ -1299,7 +1143,6 @@ def process_replies():
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
-        if text.startswith("/mt"): mt_start(); continue
         if text.startswith("/ganhos"):
             parts = text.split()
             dias = 1
@@ -1326,10 +1169,6 @@ def process_replies():
             menu_fechar(); continue
         if text.startswith("/ajuda") or text.startswith("/start"): mostrar_ajuda(); continue
         if text.startswith("/"): continue
-        # MT input processing
-        if CHAT_ID in mt_state:
-            if mt_input(text): continue
-        
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
             send("❌ Cancelado"); pending.pop(CHAT_ID, None); continue
