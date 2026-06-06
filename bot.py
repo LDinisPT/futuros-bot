@@ -310,7 +310,7 @@ def count_trades_hoje():
     return count
 
 def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
-    sym, price, _, rsi_v, label, score, reasons, atr_val = sig
+    sym, price, _, rsi_v, label, score, score_breakdown, reasons, atr_val = sig
     is_long = "LONG" in label
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
     sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
@@ -566,12 +566,12 @@ def analyze():
                 print(f"❌ Sem dados {bgsym}")
                 continue
             
-            # Extrai dados
-            ohlc = candles  # Já está em formato [open, high, low, close, volume, ...]
+            # Extrai dados (formato Bitget: [ts, open, high, low, close, vol_base, vol_quote])
+            ohlc = candles
             closes = [float(c[4]) for c in ohlc]
             highs = [float(c[2]) for c in ohlc]
             lows = [float(c[3]) for c in ohlc]
-            volumes = [float(c[5]) for c in ohlc] if len(c) > 5 else [1]*len(ohlc)
+            volumes = [float(c[5]) if len(c) > 5 else 1.0 for c in ohlc]
             
             # ===== BITGET TICKER =====
             price, _ = bg_get_ticker(bgsym)
@@ -734,7 +734,7 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
         if buf: send_photo(buf, cap)
         else: send(cap)
         # Executa automático
-        executar_trade(sig, ohlc, e20, e50, bgsym, 50, "hibrido", "margem")
+        executar_trade(sig, bgsym, 50, "hibrido", "margem")
     else:
         # ENTRADA MANUAL (score 4-5 ou -4 a -5) COM BOTÕES
         cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
@@ -764,6 +764,7 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
         else: send_with_buttons(cap, buttons)
 
 def forcar_teste(symbol):
+    """Testa análise de um par específico - USA BITGET"""
     symbol = symbol.upper()
     alvo = None
     for pair,sym,bgsym in PAIRS:
@@ -772,21 +773,60 @@ def forcar_teste(symbol):
     if not alvo:
         send(f"⚠️ Par inválido. Ex: /teste LTC")
         return
-    pair,sym,bgsym = alvo
+    
+    pair, sym, bgsym = alvo
     try:
-        od=requests.get("https://api.kraken.com/0/public/OHLC",params={"pair":pair,"interval":60},timeout=15).json()
-        ohlc=od["result"][list(od["result"].keys())[0]]
-        closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
-        td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
-        t=td["result"][list(td["result"].keys())[0]]
-        price=float(t["c"][0]); r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
-        bull=e20[-1]>e50[-1]; atr_val=atr(highs,lows,closes)
+        # ===== BITGET OHLC =====
+        candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
+        if not candles:
+            send(f"❌ Erro ao obter dados de {sym}"); return
+        
+        ohlc = candles
+        closes = [float(c[4]) for c in ohlc]
+        highs = [float(c[2]) for c in ohlc]
+        lows = [float(c[3]) for c in ohlc]
+        
+        # ===== BITGET TICKER =====
+        price, _ = bg_get_ticker(bgsym)
+        if not price:
+            send(f"❌ Erro ao obter preço de {sym}"); return
+        
+        # Indicadores
+        r = rsi(closes)
+        e20 = ema_arr(closes, 20)
+        e50 = ema_arr(closes, 50)
+        bull = e20[-1] > e50[-1]
+        atr_val = atr(highs, lows, closes)
+        
+        # Score breakdown
+        score_breakdown = {}
+        reasons = []
+        
+        if r < 30:
+            score_breakdown['RSI'] = 3.0
+            reasons.append("RSI sobrevendido")
+        elif r > 70:
+            score_breakdown['RSI'] = -3.0
+            reasons.append("RSI sobrecomprado")
+        else:
+            score_breakdown['RSI'] = 0.0
+        
+        score_breakdown['EMA'] = 2.0 if bull else -2.0
+        reasons.append("EMA " + ("bullish" if bull else "bearish"))
+        
         label = "🟢 LONG FORTE" if bull else "🔴 SHORT FORTE"
-        sig=(sym,price,0,r,label,0,["TESTE MANUAL"],atr_val)
-        send(f"🧪 Teste: {sym}")
-        enviar_sinal(sig,ohlc,e20,e50,bgsym)
+        score = sum(score_breakdown.values())
+        
+        # Novo formato: (sym, price, 0, rsi, label, score, score_breakdown, reasons, atr_val)
+        sig = (sym, price, 0, r, label, score, score_breakdown, reasons, atr_val)
+        
+        send(f"🧪 <b>TESTE: {sym}</b>\n━━━━━━━━━━━━━━━\n💲 ${price:,.2f}\n📊 RSI: {r:.1f}\n⚡ {label}")
+        enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL")
+        
     except Exception as e:
-        send(f"⚠️ Erro: {e}")
+        send(f"⚠️ Erro teste {sym}: {str(e)[:80]}")
+        print(f"Teste error {sym}: {e}")
+
 
 def mt_exec(args):
     """
