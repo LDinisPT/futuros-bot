@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.16"
+VERSAO = "v5.17"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -265,15 +265,18 @@ def bg_cancel_all(symbol):
 
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
-    sl_m, tp1_m, tp2_m = 1.5, 2.8, 5.0  # SL: 1.5 ATR
+    sl_m, tp1_m, tp2_m = 1.5, 2.8, 5.0  # multiplicadores ATR
     # Distancia do SL por ATR, mas nunca menos que SL_MIN_PCT da entrada
     sl_dist = atr_val * sl_m
     sl_min = price * (SL_MIN_PCT / 100)
     if sl_dist < sl_min:
         sl_dist = sl_min
+    # TP proporcional ao SL FINAL (mantem racio mesmo quando o minimo atua)
+    tp1_dist = sl_dist * (tp1_m / sl_m)   # racio 2.8/1.5 = 1.87
+    tp2_dist = sl_dist * (tp2_m / sl_m)   # racio 5.0/1.5 = 3.33
     if "LONG" in signal:
-        return price - sl_dist, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
-    return price + sl_dist, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
+        return price - sl_dist, price + tp1_dist, price + tp2_dist, 3
+    return price + sl_dist, price - tp1_dist, price - tp2_dist, 3
 
 def get_funding_rate(symbol):
     try:
@@ -446,6 +449,12 @@ def verificar_posicoes_fechadas():
                         m += f"📋 Modo: {info_antiga['modo']}"
                         send(m)
                         break
+            
+            # Cancela ordens orfas (trailing/TP que sobraram do fecho)
+            try:
+                bg_cancel_all(bgsym)
+            except Exception as e:
+                print(f"Erro a cancelar ordens orfas {bgsym}: {e}")
             
             del posicoes_abertas_cache[bgsym]
 
@@ -896,12 +905,14 @@ def mt_exec(args):
         sl_min = price * (SL_MIN_PCT / 100)
         if sl_dist < sl_min:
             sl_dist = sl_min
+        # TP proporcional ao SL final (mantem racio 1.87)
+        tp_dist = sl_dist * (2.8 / 1.5)
         if is_long:
             sl = price - sl_dist
-            tp = price + (atr_val * 2.8)
+            tp = price + tp_dist
         else:
             sl = price + sl_dist
-            tp = price - (atr_val * 2.8)
+            tp = price - tp_dist
         
         # Arredonda preços para precisão Bitget
         sl = round(sl, 2)
@@ -1154,10 +1165,58 @@ def mostrar_stats():
     m += f"⏱️ Duração média: {duracao_media:.0f}m"
     send(m)
 
+def limpar_ordens():
+    """Cancela ordens orfas (sem posicao aberta correspondente)"""
+    send("🧹 A procurar ordens orfas...")
+    
+    # Posicoes abertas atuais
+    resp = bg_request("GET", "/api/v2/mix/position/all-position",
+                      {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+    posicoes_ativas = set()
+    if resp.get("code") == "00000":
+        posicoes_ativas = {p.get("symbol") for p in resp.get("data", [])
+                           if float(p.get("total",0)) > 0}
+    
+    # Ordens plan abertas (trailing/TP/SL pendentes)
+    resp_o = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
+                        {"productType":"USDT-FUTURES"})
+    
+    simbolos_com_ordens = set()
+    if resp_o.get("code") == "00000":
+        d = resp_o.get("data")
+        lista = d.get("entrustedList") or d.get("list") or [] if isinstance(d, dict) else (d or [])
+        for o in (lista or []):
+            sym = o.get("symbol")
+            if sym:
+                simbolos_com_ordens.add(sym)
+    
+    # Orfas = tem ordens mas nao tem posicao
+    orfas = simbolos_com_ordens - posicoes_ativas
+    
+    if not orfas:
+        send("✅ Sem ordens orfas. Tudo limpo!")
+        return
+    
+    canceladas = []
+    for sym in orfas:
+        try:
+            r = bg_cancel_all(sym)
+            if r.get("code") == "00000":
+                canceladas.append(sym)
+        except Exception as e:
+            print(f"Erro a cancelar {sym}: {e}")
+    
+    if canceladas:
+        m = f"🧹 <b>{len(canceladas)} pares limpos:</b>\n"
+        m += "\n".join(f"  • {s}" for s in canceladas)
+        send(m)
+    else:
+        send("⚠️ Encontrei orfas mas nao consegui cancelar. Tenta na Bitget.")
+
 def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
     m += "/saldo /posicoes /ganhos /stats\n"
-    m += "/fechar SOL /teste LTC /ajuda\n"
+    m += "/fechar SOL /teste LTC /limpar /ajuda\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += "<b>📊 MANUAL TRADE:</b>\n"
     m += "/mt PAR L/S MARGEM ALAV\n"
@@ -1403,6 +1462,7 @@ def process_replies():
         if not text: continue
         if text.startswith("/teste"):
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
+        if text.startswith("/limpar"): limpar_ordens(); continue
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
         if text.startswith("/mt "):
