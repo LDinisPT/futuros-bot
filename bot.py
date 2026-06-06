@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.11"
+VERSAO = "v5.12"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -901,7 +901,13 @@ def mostrar_stats():
 def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
     m += "/saldo /posicoes /ganhos /stats\n"
-    m += "/fechar SOL /teste LTC /ajuda\n━━━━━━━━━━━━━━━\n"
+    m += "/fechar SOL /teste LTC /ajuda\n"
+    m += "━━━━━━━━━━━━━━━\n"
+    m += "<b>📊 MANUAL TRADE:</b>\n"
+    m += "/mt PAR L/S MARGEM ALAV\n"
+    m += "Ex: <code>/mt BTC L 50 10</code>\n"
+    m += "Ex: <code>/mt ETH S 75 5</code>\n"
+    m += "━━━━━━━━━━━━━━━\n"
     m += "<b>⚡ AUTOMÁTICO (Score ≥ 6):</b>\n"
     m += "Bot entra $50 hibrido sozinho!\n"
     m += "━━━━━━━━━━━━━━━\n"
@@ -1122,6 +1128,118 @@ def fechar_posicao_callback(symbol):
     else: 
         send(f"❌ Erro: {close_r.get('msg','?')}")
 
+def mt_exec(args):
+    """
+    /mt BTC L 50 10
+    Abre posição DIRETO com híbrido automático
+    """
+    if len(args) < 5:
+        send("❌ Uso: /mt PAR L/S MARGEM ALAV\nEx: /mt BTC L 50 10"); return
+    
+    par = args[1].upper() + "USDT"
+    side = args[2].upper()
+    
+    try:
+        margem = float(args[3])
+        alav = float(args[4])
+    except:
+        send("❌ Margem e alav devem ser números"); return
+    
+    if side not in ['L', 'S']:
+        send("❌ L ou S"); return
+    
+    if margem <= 0 or alav <= 0:
+        send("❌ Valores > 0"); return
+    
+    if alav > 125:
+        send("❌ Max 125x"); return
+    
+    notional = margem * alav
+    if notional > MAX_NOTIONAL:
+        send(f"❌ ${notional:.0f} > ${MAX_NOTIONAL}"); return
+    
+    pares_validos = ["BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","ADAUSDT","DOTUSDT","LINKUSDT","UNIUSDT","ATOMUSDT","LTCUSDT","DOGEUSDT","AAVEUSDT"]
+    if par not in pares_validos:
+        send(f"❌ {par} inválido"); return
+    
+    if check_open_position(par):
+        send(f"⚠️ Já tem {par}"); return
+    
+    is_long = side == 'L'
+    
+    send(f"⏳ Abrindo {par} {('LONG' if is_long else 'SHORT')}...")
+    
+    try:
+        # Busca preço
+        pk = par.replace("USDT", "USD")
+        r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pk}, timeout=10).json()
+        price = float(r["result"][list(r["result"].keys())[0]]["c"][0])
+        
+        # Busca OHLC para ATR
+        r2 = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pk, "interval": 60}, timeout=15).json()
+        ohlc = r2["result"][list(r2["result"].keys())[0]]
+        closes = [float(c[4]) for c in ohlc]
+        highs = [float(c[2]) for c in ohlc]
+        lows = [float(c[3]) for c in ohlc]
+        atr_val = atr(highs, lows, closes)
+        
+        # SL/TP
+        if is_long:
+            sl = price - (atr_val * 1.2)
+            tp = price + (atr_val * 2.8)
+        else:
+            sl = price + (atr_val * 1.2)
+            tp = price - (atr_val * 2.8)
+        
+        # Tamanho
+        size = notional / price
+        
+        # Set leverage
+        bg_set_leverage(par, alav)
+        time.sleep(1)
+        
+        # ABRE ORDEM (50% TP)
+        result = bg_place_order(par, is_long, size/2, sl, tp)
+        
+        if result.get("code") != "00000":
+            send(f"❌ Erro ao abrir: {result.get('msg','?')}"); return
+        
+        time.sleep(0.5)
+        
+        # Coloca trailing (50%)
+        bg_place_trailing(par, is_long, size/2, tp, CALLBACK_RATIO)
+        
+        # Sucesso!
+        risco = abs(sl - price) * size
+        ganho = abs(tp - price) * size
+        
+        m = f"✅ <b>POSIÇÃO ABERTA!</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"{'↑' if is_long else '↓'} <b>{par} {'LONG' if is_long else 'SHORT'}</b> (HÍBRIDO)\n"
+        m += f"💲 Entrada: ${price:,.2f}\n"
+        m += f"🛑 SL: ${sl:,.2f}\n"
+        m += f"🎯 TP1: ${tp:,.2f}\n"
+        m += "━━━━━━━━━━━━━━━\n"
+        m += f"⚡ Alavancagem: {alav:.1f}x\n"
+        m += f"💰 Margem: ${margem:.2f}\n"
+        m += f"📏 Notional: ${notional:.2f}\n"
+        m += f"💔 Risco máximo: ${risco:+.2f}\n"
+        m += f"💎 Ganho potencial: ${ganho:+.2f}"
+        
+        send(m)
+        
+        # Cache
+        posicoes_abertas_cache[par] = {
+            'entrada': price,
+            'tempo_abertura': time.time(),
+            'modo': 'hibrido',
+            'sym': par.replace("USDT", ""),
+            'lado': 'LONG' if is_long else 'SHORT'
+        }
+        
+    except Exception as e:
+        send(f"❌ Erro: {str(e)[:80]}")
+        print(f"MT Error: {e}")
+
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -1143,6 +1261,10 @@ def process_replies():
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
+        if text.startswith("/mt "):
+            args = text.split()
+            mt_exec(args)
+            continue
         if text.startswith("/ganhos"):
             parts = text.split()
             dias = 1
