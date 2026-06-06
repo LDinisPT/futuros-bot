@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.10"
+VERSAO = "v5.11"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -772,29 +772,93 @@ def fechar_posicao(symbol):
     else: 
         send(f"❌ Erro ao fechar: {close_r.get('msg','?')}")
 
-def mostrar_ganhos():
-    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
+def mostrar_ganhos(dias=1):
+    """Mostra ganhos dos últimos N dias"""
+    resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"500"})
     if resp.get("code")!="00000": send(f"⚠️ Erro"); return
+    
     d = resp.get("data")
     lista = d.get("list",[]) if isinstance(d, dict) else (d or [])
-    hoje = time.strftime("%Y-%m-%d", time.gmtime())
-    trades_hoje = []
+    if not lista: send("📭 Sem trades registados"); return
+    
+    import datetime
+    
+    # Agrupa trades por dia
+    trades_por_dia = {}
+    agora = datetime.datetime.utcnow()
+    
     for p in lista:
         utime = int(p.get("utime") or 0)
         if utime == 0: continue
-        data_fecho = time.strftime("%Y-%m-%d", time.gmtime(utime/1000))
-        if data_fecho == hoje:
-            trades_hoje.append(p)
-    if not trades_hoje: send("📭 Sem trades hoje"); return
-    total=0; wins=0; losses=0; linhas=[]
-    for p in trades_hoje:
-        sym=p.get("symbol","?")
-        pnl=float(p.get("netProfit") or p.get("pnl") or 0)
-        total+=pnl; wins+=1 if pnl>0 else 0; losses+=1 if pnl<0 else 0
-        linhas.append(f"{'🟢' if pnl>=0 else '🔴'} {sym}: ${pnl:+.2f}")
-    m=f"📒 <b>HOJE ({len(trades_hoje)} trades)</b>\n━━━━━━━━━━━━━━━\n"
-    m+="\n".join(linhas)
-    m+=f"\n━━━━━━━━━━━━━━━\n✅ {wins} | ❌ {losses}\n💰 <b>${total:+.2f}</b>"
+        
+        data_fecho = datetime.datetime.utcfromtimestamp(utime/1000)
+        data_str = data_fecho.strftime("%Y-%m-%d")
+        
+        # Verifica se está dentro do range de dias
+        dias_atras = (agora - data_fecho).days
+        if dias_atras >= dias:
+            continue
+        
+        if data_str not in trades_por_dia:
+            trades_por_dia[data_str] = []
+        
+        trades_por_dia[data_str].append(p)
+    
+    if not trades_por_dia:
+        send(f"📭 Sem trades nos últimos {dias} dias"); return
+    
+    # Ordena por data (mais recente primeiro)
+    datas_ordenadas = sorted(trades_por_dia.keys(), reverse=True)
+    
+    m = f"📈 <b>GANHOS — ÚLTIMOS {dias} DIAS</b>\n"
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    total_geral = 0
+    total_trades = 0
+    
+    for data_str in datas_ordenadas:
+        trades_dia = trades_por_dia[data_str]
+        total_dia = 0
+        wins = 0
+        losses = 0
+        
+        for p in trades_dia:
+            sym = p.get("symbol","?")
+            pnl = float(p.get("netProfit") or p.get("pnl") or 0)
+            total_dia += pnl
+            wins += 1 if pnl > 0 else 0
+            losses += 1 if pnl < 0 else 0
+        
+        total_geral += total_dia
+        total_trades += len(trades_dia)
+        
+        win_rate = (wins / len(trades_dia) * 100) if trades_dia else 0
+        emoji_dia = "🟢" if total_dia >= 0 else "🔴"
+        sinal = "+" if total_dia >= 0 else ""
+        
+        m += f"📅 {data_str} {emoji_dia}\n"
+        m += f"  Trades: {len(trades_dia)}\n"
+        m += f"  Ganho: <b>${sinal}{total_dia:+.2f}</b>\n"
+        m += f"  Win rate: {win_rate:.0f}% ({wins}/{len(trades_dia)})\n"
+        
+        # Melhor e pior trade do dia
+        trades_dia_sorted = sorted(trades_dia, key=lambda x: float(x.get("netProfit") or x.get("pnl") or 0), reverse=True)
+        if trades_dia_sorted:
+            melhor_pnl = float(trades_dia_sorted[0].get("netProfit") or trades_dia_sorted[0].get("pnl") or 0)
+            melhor_sym = trades_dia_sorted[0].get("symbol", "?")
+            m += f"  Melhor: +${melhor_pnl:.2f} ({melhor_sym})\n"
+        
+        m += "\n"
+    
+    m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    sinal_geral = "+" if total_geral >= 0 else ""
+    emoji_geral = "🟢" if total_geral >= 0 else "🔴"
+    media_dia = total_geral / dias if dias > 0 else 0
+    
+    m += f"{emoji_geral} <b>TOTAL {dias} DIAS: ${sinal_geral}{total_geral:+.2f}</b>\n"
+    m += f"💰 Média/dia: ${sinal_geral}{media_dia:+.2f}\n"
+    m += f"📊 Total trades: {total_trades}"
+    
     send(m)
 
 def mostrar_stats():
@@ -1079,7 +1143,16 @@ def process_replies():
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
-        if text.startswith("/ganhos"): mostrar_ganhos(); continue
+        if text.startswith("/ganhos"):
+            parts = text.split()
+            dias = 1
+            if len(parts) > 1:
+                try:
+                    dias = int(parts[1])
+                    dias = min(dias, 30)  # Máximo 30 dias
+                except:
+                    dias = 1
+            mostrar_ganhos(dias); continue
         if text.startswith("/stats"):
             parts = text.split()
             if len(parts) > 1:
