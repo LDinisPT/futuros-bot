@@ -11,11 +11,53 @@ BG_SECRET = os.environ["BITGET_SECRET"]
 BG_PASS = os.environ["BITGET_PASSPHRASE"]
 API = f"https://api.telegram.org/bot{TOKEN}"
 BG_API = "https://api.bitget.com"
+VERSAO = "v5.13"
+# ==================== BITGET MARKET DATA (substituiu Kraken) ====================
+def bg_get_ohlcv(bgsym, granularity="60", limit=200):
+    """Busca velas OHLCV da Bitget Futures. granularity em minutos: 1 5 15 60 240 1D"""
+    try:
+        resp = requests.get(
+            f"{BG_API}/api/v2/mix/market/candles",
+            params={"symbol": bgsym, "productType": "USDT-FUTURES",
+                    "granularity": granularity, "limit": str(limit)},
+            timeout=15
+        )
+        data = resp.json()
+        if data.get("code") != "00000":
+            print(f"Erro OHLCV {bgsym}: {data.get('msg')}")
+            return None
+        candles = data.get("data", [])
+        candles.reverse()  # Bitget: mais recente primeiro, invertemos
+        return candles
+    except Exception as e:
+        print(f"Erro bg_get_ohlcv {bgsym}: {e}")
+        return None
+
+def bg_get_ticker(bgsym):
+    """Busca preço actual da Bitget. Retorna (price, open_24h)"""
+    try:
+        resp = requests.get(
+            f"{BG_API}/api/v2/mix/market/ticker",
+            params={"symbol": bgsym, "productType": "USDT-FUTURES"},
+            timeout=10
+        )
+        data = resp.json()
+        if data.get("code") != "00000":
+            return None, None
+        t = data["data"][0]
+        price  = float(t.get("lastPr") or t.get("last") or 0)
+        open24 = float(t.get("open24h") or t.get("openUtc0") or price)
+        return price, open24
+    except Exception as e:
+        print(f"Erro ticker {bgsym}: {e}")
+        return None, None
+
+
 
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.12"
+VERSAO = "v5.13"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -521,104 +563,90 @@ def analyze():
     signals = []
     for pair, sym, bgsym in PAIRS:
         try:
-            od = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair":pair,"interval":60}, timeout=15).json()
-            ohlc = od["result"][list(od["result"].keys())[0]]
-            closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
-            volumes=[float(c[6]) for c in ohlc]
-            td=requests.get("https://api.kraken.com/0/public/Ticker", params={"pair":pair}, timeout=10).json()
-            t=td["result"][list(td["result"].keys())[0]]
-            price=float(t["c"][0]); op=float(t["o"])
+            # Fetch OHLCV da Bitget (1h)
+            candles = bg_get_ohlcv(bgsym, granularity="60", limit=200)
+            if not candles or len(candles) < 30:
+                print(f"{sym}: sem dados suficientes")
+                continue
+            # Bitget: [timestamp, open, high, low, close, volume, ...]
+            ohlc    = candles
+            closes  = [float(c[4]) for c in candles]
+            highs   = [float(c[2]) for c in candles]
+            lows    = [float(c[3]) for c in candles]
+            volumes = [float(c[5]) for c in candles]
+            # Preço actual da Bitget
+            price, op = bg_get_ticker(bgsym)
+            if not price:
+                price = closes[-1]
+                op    = closes[-2] if len(closes) > 1 else price
             r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
             bull=e20[-1]>e50[-1]
             ml,sl_,hist=macd(closes); atr_val=atr(highs,lows,closes)
             vol_recente = sum(volumes[-5:]) / 5
             vol_medio = sum(volumes[-25:-5]) / 20 if len(volumes)>=25 else vol_recente
             vol_ratio = vol_recente / vol_medio if vol_medio else 1
-            
-            # Funding Rate
             funding = get_funding_rate(bgsym)
-            
-            # Candlestick Patterns
-            engulfing = detect_engulfing(ohlc)
-            rejection = detect_rejection(ohlc)
+            engulfing  = detect_engulfing(ohlc)
+            rejection  = detect_rejection(ohlc)
             inside_bar = detect_inside_bar(ohlc)
-            
             score=0.0; score_breakdown={}; reasons=[]
-            
-            # RSI (0 a ±3)
+            # RSI
             rsi_score = 0.0
             if r<30: rsi_score=3.0; reasons.append("RSI sobrevendido")
             elif r<40: rsi_score=1.5
             elif r>70: rsi_score=-3.0; reasons.append("RSI sobrecomprado")
             elif r>60: rsi_score=-1.5
-            score += rsi_score
-            score_breakdown['RSI'] = rsi_score
-            
-            # EMA (0 a ±2)
-            ema_score = 0.0
-            if bull: ema_score=2.0; reasons.append("EMA bullish")
-            else: ema_score=-2.0; reasons.append("EMA bearish")
-            score += ema_score
-            score_breakdown['EMA'] = ema_score
-            
-            # MACD (0 a ±2)
+            score += rsi_score; score_breakdown['RSI'] = rsi_score
+            # EMA
+            ema_score = 2.0 if bull else -2.0
+            if bull: reasons.append("EMA bullish")
+            else:    reasons.append("EMA bearish")
+            score += ema_score; score_breakdown['EMA'] = ema_score
+            # MACD
             macd_score = 0.0
-            if ml>sl_ and hist>0: macd_score=2.0; reasons.append("MACD bullish")
+            if ml>sl_ and hist>0:   macd_score=2.0;  reasons.append("MACD bullish")
             elif ml<sl_ and hist<0: macd_score=-2.0; reasons.append("MACD bearish")
-            score += macd_score
-            score_breakdown['MACD'] = macd_score
-            
-            # Volume (0 a ±1)
+            score += macd_score; score_breakdown['MACD'] = macd_score
+            # Volume
             vol_score = 0.0
-            if vol_ratio > 1.3 and score>0: vol_score=1.0; reasons.append("Volume↑")
-            elif vol_ratio < 0.6: vol_score=-0.5; reasons.append("Volume baixo")
-            score += vol_score
-            score_breakdown['Volume'] = vol_score
-            
-            # Funding Rate (0 a ±1)
+            if vol_ratio > 1.3 and score>0: vol_score=1.0;  reasons.append("Volume↑")
+            elif vol_ratio < 0.6:            vol_score=-0.5; reasons.append("Volume baixo")
+            score += vol_score; score_breakdown['Volume'] = vol_score
+            # Funding Rate
             funding_score = 0.0
             if score > 0 and funding > 0.03:
                 funding_score -= 1.0; reasons.append(f"Funding alto ({funding:+.3%})")
             elif score < 0 and funding < -0.03:
                 funding_score += 1.0; reasons.append(f"Funding baixo ({funding:+.3%})")
-            score += funding_score
-            score_breakdown['Funding'] = funding_score
-            
-            # Candlestick Patterns (0 a ±2.5)
+            score += funding_score; score_breakdown['Funding'] = funding_score
+            # Candlestick Patterns
             pattern_score = 0.0
             if engulfing > 0 and score > 0:
                 pattern_score += engulfing; reasons.append("Engulfing bullish ✅")
             elif engulfing < 0 and score < 0:
                 pattern_score += engulfing; reasons.append("Engulfing bearish ✅")
-            
             if rejection != 0:
-                pattern_score += rejection; reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
-            
+                pattern_score += rejection
+                reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
             if inside_bar > 0:
-                if score > 0: pattern_score += inside_bar; reasons.append("Consolidação bullish")
+                if score > 0:   pattern_score += inside_bar; reasons.append("Consolidação bullish")
                 elif score < 0: pattern_score += inside_bar; reasons.append("Consolidação bearish")
-            
-            score += pattern_score
-            score_breakdown['Padrões'] = pattern_score
-            
-            # Arredondar score para 1 decimal
+            score += pattern_score; score_breakdown['Padrões'] = pattern_score
             score = round(score, 1)
-            
             if score>=6.0:
-                # AUTOMÁTICO! Score muito forte
                 signals.append(((sym,price,0,r,"🟢 LONG MUITO FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
             elif score<=-6.0:
-                # AUTOMÁTICO! Score muito forte negativo
                 signals.append(((sym,price,0,r,"🔴 SHORT MUITO FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"AUTO"))
             elif score>=4.0:
                 signals.append(((sym,price,0,r,"🟢 LONG FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
             elif score<=-4.0:
                 signals.append(((sym,price,0,r,"🔴 SHORT FORTE",score,score_breakdown,reasons,atr_val),ohlc,e20,e50,bgsym,"MANUAL"))
-            print(f"{sym}: RSI={r} score={score:.1f} funding={funding:+.3%}")
-            time.sleep(0.6)
+            print(f"{sym}: RSI={r} score={score:.1f} funding={funding:+.3%} [Bitget]")
+            time.sleep(0.3)
         except Exception as e:
             print(f"Erro {sym}: {e}")
     return signals
+
 
 def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
     sym,price,_,rsi_v,label,score,score_breakdown,reasons,atr_val = sig
@@ -684,23 +712,27 @@ def forcar_teste(symbol):
         if sym == symbol:
             alvo = (pair,sym,bgsym); break
     if not alvo:
-        send(f"⚠️ Par inválido. Ex: /teste LTC")
-        return
+        send(f"⚠️ Par inválido. Ex: /teste LTC"); return
     pair,sym,bgsym = alvo
     try:
-        od=requests.get("https://api.kraken.com/0/public/OHLC",params={"pair":pair,"interval":60},timeout=15).json()
-        ohlc=od["result"][list(od["result"].keys())[0]]
-        closes=[float(c[4]) for c in ohlc]; highs=[float(c[2]) for c in ohlc]; lows=[float(c[3]) for c in ohlc]
-        td=requests.get("https://api.kraken.com/0/public/Ticker",params={"pair":pair},timeout=10).json()
-        t=td["result"][list(td["result"].keys())[0]]
-        price=float(t["c"][0]); r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
+        candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
+        if not candles:
+            send(f"⚠️ Sem dados para {sym}"); return
+        ohlc   = candles
+        closes = [float(c[4]) for c in candles]
+        highs  = [float(c[2]) for c in candles]
+        lows   = [float(c[3]) for c in candles]
+        price, _ = bg_get_ticker(bgsym)
+        if not price: price = closes[-1]
+        r=rsi(closes); e20=ema_arr(closes,20); e50=ema_arr(closes,50)
         bull=e20[-1]>e50[-1]; atr_val=atr(highs,lows,closes)
         label = "🟢 LONG FORTE" if bull else "🔴 SHORT FORTE"
-        sig=(sym,price,0,r,label,0,["TESTE MANUAL"],atr_val)
-        send(f"🧪 Teste: {sym}")
+        sig=(sym,price,0,r,label,0,{},["TESTE MANUAL"],atr_val)
+        send(f"🧪 Teste: {sym} @ ${fmt(price)} [Bitget]")
         enviar_sinal(sig,ohlc,e20,e50,bgsym)
     except Exception as e:
         send(f"⚠️ Erro: {e}")
+
 
 def mostrar_saldo():
     resp = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
@@ -1170,17 +1202,18 @@ def mt_exec(args):
     send(f"⏳ Abrindo {par} {('LONG' if is_long else 'SHORT')}...")
     
     try:
-        # Busca preço
-        pk = par.replace("USDT", "USD")
-        r = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pk}, timeout=10).json()
-        price = float(r["result"][list(r["result"].keys())[0]]["c"][0])
+        # Busca preço da Bitget
+        price, _ = bg_get_ticker(par)
+        if not price:
+            send(f"❌ Erro ao obter preço de {par}"); return
         
-        # Busca OHLC para ATR
-        r2 = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pk, "interval": 60}, timeout=15).json()
-        ohlc = r2["result"][list(r2["result"].keys())[0]]
-        closes = [float(c[4]) for c in ohlc]
-        highs = [float(c[2]) for c in ohlc]
-        lows = [float(c[3]) for c in ohlc]
+        # Busca OHLC para ATR da Bitget
+        candles = bg_get_ohlcv(par, granularity="60", limit=100)
+        if not candles:
+            send(f"❌ Erro ao obter dados de {par}"); return
+        closes = [float(c[4]) for c in candles]
+        highs  = [float(c[2]) for c in candles]
+        lows   = [float(c[3]) for c in candles]
         atr_val = atr(highs, lows, closes)
         
         # SL/TP
@@ -1331,7 +1364,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b> [Bitget Prices]\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
 while True:
     process_replies()
