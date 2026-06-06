@@ -263,6 +263,33 @@ def bg_cancel_all(symbol):
         "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT"
     })
 
+def bg_list_plan_orders(plan_type):
+    """Lista plan orders pendentes de um tipo (normal_plan ou track_plan)"""
+    resp = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
+                      {"productType":"USDT-FUTURES", "planType":plan_type})
+    ordens = []
+    if resp.get("code") == "00000":
+        d = resp.get("data")
+        if isinstance(d, dict):
+            lista = d.get("entrustedList") or d.get("list") or []
+        else:
+            lista = d or []
+        for o in (lista or []):
+            ordens.append({
+                "symbol": o.get("symbol"),
+                "orderId": o.get("orderId") or o.get("planOrderId") or o.get("id"),
+                "clientOid": o.get("clientOid")
+            })
+    return ordens
+
+def bg_cancel_plan_order(symbol, order_id, plan_type):
+    """Cancela uma plan order especifica (trailing ou TP/SL)"""
+    return bg_request("POST", "/api/v2/mix/order/cancel-plan-order", {
+        "symbol": symbol, "productType": "USDT-FUTURES",
+        "marginCoin": "USDT", "planType": plan_type,
+        "orderIdList": [{"orderId": order_id}]
+    })
+
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
     sl_m, tp1_m, tp2_m = 1.5, 2.8, 5.0  # multiplicadores ATR
@@ -453,6 +480,10 @@ def verificar_posicoes_fechadas():
             # Cancela ordens orfas (trailing/TP que sobraram do fecho)
             try:
                 bg_cancel_all(bgsym)
+                # Trailing (track_plan) precisa de cancelamento proprio
+                for o in bg_list_plan_orders("track_plan"):
+                    if o["symbol"] == bgsym and o.get("orderId"):
+                        bg_cancel_plan_order(bgsym, o["orderId"], "track_plan")
             except Exception as e:
                 print(f"Erro a cancelar ordens orfas {bgsym}: {e}")
             
@@ -1166,7 +1197,7 @@ def mostrar_stats():
     send(m)
 
 def limpar_ordens():
-    """Cancela ordens orfas (sem posicao aberta correspondente)"""
+    """Cancela ordens orfas (plan orders sem posicao aberta correspondente)"""
     send("🧹 A procurar ordens orfas...")
     
     # Posicoes abertas atuais
@@ -1177,41 +1208,50 @@ def limpar_ordens():
         posicoes_ativas = {p.get("symbol") for p in resp.get("data", [])
                            if float(p.get("total",0)) > 0}
     
-    # Ordens plan abertas (trailing/TP/SL pendentes)
-    resp_o = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
-                        {"productType":"USDT-FUTURES"})
+    # Lista plan orders dos dois tipos: trailing (track_plan) e TP/SL (normal_plan)
+    todas = []
+    for ptype in ["track_plan", "normal_plan"]:
+        for o in bg_list_plan_orders(ptype):
+            o["planType"] = ptype
+            todas.append(o)
     
-    simbolos_com_ordens = set()
-    if resp_o.get("code") == "00000":
-        d = resp_o.get("data")
-        lista = d.get("entrustedList") or d.get("list") or [] if isinstance(d, dict) else (d or [])
-        for o in (lista or []):
-            sym = o.get("symbol")
-            if sym:
-                simbolos_com_ordens.add(sym)
-    
-    # Orfas = tem ordens mas nao tem posicao
-    orfas = simbolos_com_ordens - posicoes_ativas
-    
-    if not orfas:
-        send("✅ Sem ordens orfas. Tudo limpo!")
+    if not todas:
+        send("✅ Sem ordens pendentes na conta.")
         return
     
-    canceladas = []
-    for sym in orfas:
-        try:
-            r = bg_cancel_all(sym)
-            if r.get("code") == "00000":
-                canceladas.append(sym)
-        except Exception as e:
-            print(f"Erro a cancelar {sym}: {e}")
+    # Orfas = ordens cujo simbolo nao tem posicao aberta
+    orfas = [o for o in todas if o["symbol"] not in posicoes_ativas]
     
-    if canceladas:
-        m = f"🧹 <b>{len(canceladas)} pares limpos:</b>\n"
-        m += "\n".join(f"  • {s}" for s in canceladas)
-        send(m)
-    else:
-        send("⚠️ Encontrei orfas mas nao consegui cancelar. Tenta na Bitget.")
+    if not orfas:
+        send(f"✅ {len(todas)} ordens, todas com posicao. Nada orfao.")
+        return
+    
+    canceladas = 0
+    falhou = 0
+    pares = set()
+    for o in orfas:
+        if not o.get("orderId"):
+            falhou += 1
+            continue
+        try:
+            r = bg_cancel_plan_order(o["symbol"], o["orderId"], o["planType"])
+            if r.get("code") == "00000":
+                canceladas += 1
+                pares.add(o["symbol"])
+            else:
+                falhou += 1
+                print(f"Falha cancelar {o['symbol']}: {r.get('msg')}")
+        except Exception as e:
+            falhou += 1
+            print(f"Erro a cancelar {o['symbol']}: {e}")
+    
+    m = f"🧹 <b>Limpeza concluida</b>\n━━━━━━━━━━━━━━━\n"
+    m += f"✅ Canceladas: {canceladas}\n"
+    if pares:
+        m += "Pares: " + ", ".join(sorted(p.replace("USDT","") for p in pares)) + "\n"
+    if falhou:
+        m += f"⚠️ Falharam: {falhou} (ver Bitget)"
+    send(m)
 
 def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
