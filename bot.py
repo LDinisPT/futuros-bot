@@ -15,10 +15,11 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.15"
+VERSAO = "v5.16"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
+SL_MIN_PCT = 0.6  # SL minimo: 0.6% da entrada (evita stops colados em mercado calmo)
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
 
 pending = {}
@@ -264,10 +265,15 @@ def bg_cancel_all(symbol):
 
 def calc_levels(price, signal, atr_val):
     if atr_val <= 0: atr_val = price * 0.01
-    sl_m, tp1_m, tp2_m = 1.5, 2.8, 5.0  # SL: 1.5 ATR (era 1.2, demasiado apertado)
+    sl_m, tp1_m, tp2_m = 1.5, 2.8, 5.0  # SL: 1.5 ATR
+    # Distancia do SL por ATR, mas nunca menos que SL_MIN_PCT da entrada
+    sl_dist = atr_val * sl_m
+    sl_min = price * (SL_MIN_PCT / 100)
+    if sl_dist < sl_min:
+        sl_dist = sl_min
     if "LONG" in signal:
-        return price - atr_val*sl_m, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
-    return price + atr_val*sl_m, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
+        return price - sl_dist, price + atr_val*tp1_m, price + atr_val*tp2_m, 3
+    return price + sl_dist, price - atr_val*tp1_m, price - atr_val*tp2_m, 3
 
 def get_funding_rate(symbol):
     try:
@@ -885,12 +891,16 @@ def mt_exec(args):
         lows   = [float(c[3]) for c in candles]
         atr_val = atr(highs, lows, closes)
         
-        # SL/TP (SL: 1.5 ATR, era 1.2)
+        # SL: 1.5 ATR, mas nunca menos que SL_MIN_PCT da entrada
+        sl_dist = atr_val * 1.5
+        sl_min = price * (SL_MIN_PCT / 100)
+        if sl_dist < sl_min:
+            sl_dist = sl_min
         if is_long:
-            sl = price - (atr_val * 1.5)
+            sl = price - sl_dist
             tp = price + (atr_val * 2.8)
         else:
-            sl = price + (atr_val * 1.5)
+            sl = price + sl_dist
             tp = price - (atr_val * 2.8)
         
         # Arredonda preços para precisão Bitget
@@ -1031,13 +1041,13 @@ def mostrar_ganhos(dias=1):
     
     # Agrupa trades por dia
     trades_por_dia = {}
-    agora = datetime.datetime.utcnow()
+    agora = datetime.datetime.now(datetime.timezone.utc)
     
     for p in lista:
         utime = int(p.get("utime") or 0)
         if utime == 0: continue
         
-        data_fecho = datetime.datetime.utcfromtimestamp(utime/1000)
+        data_fecho = datetime.datetime.fromtimestamp(utime/1000, datetime.timezone.utc)
         data_str = data_fecho.strftime("%Y-%m-%d")
         
         # Verifica se está dentro do range de dias
