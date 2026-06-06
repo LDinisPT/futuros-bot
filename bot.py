@@ -27,7 +27,7 @@ last_analysis = 0
 last_position_check = 0
 posicoes_abertas_cache = {}
 trades_history = []  # Histórico de todos os trades fechados
-manual_trade_state = {}  # Estado do MT em construção
+manual_trade_state = {}  # Estado do MT
 
 def send(msg):
     try:
@@ -899,209 +899,6 @@ def mostrar_stats():
     m += f"⏱️ Duração média: {duracao_media:.0f}m"
     send(m)
 
-def iniciar_manual_trade():
-    """Inicia fluxo de manual trade"""
-    send("📊 <b>MANUAL TRADE (/mt)</b>\n━━━━━━━━━━━━━━━\n\n🔤 Qual é o PAR?\n(ex: BTC, SOL, LINK, ETH, ADA, DOT, UNI, ATOM, LTC, DOGE, AAVE)")
-    manual_trade_state[CHAT_ID] = {'step': 'par'}
-
-def executar_manual_trade(par, side, margem, alavancagem):
-    """Executa manual trade - abre posição REAL"""
-    is_long = side == 'LONG'
-    
-    # Busca preço Kraken
-    try:
-        pair_kraken = par.replace("USDT", "USD")
-        td = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair_kraken}, timeout=10).json()
-        t = td["result"][list(td["result"].keys())[0]]
-        price = float(t["c"][0])
-    except:
-        send("⚠️ Erro a buscar preço"); return
-    
-    # Busca ATR
-    try:
-        od = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair_kraken, "interval": 60}, timeout=15).json()
-        ohlc = od["result"][list(od["result"].keys())[0]]
-        closes = [float(c[4]) for c in ohlc]
-        highs = [float(c[2]) for c in ohlc]
-        lows = [float(c[3]) for c in ohlc]
-        atr_val = atr(highs, lows, closes)
-    except:
-        atr_val = price * 0.01
-    
-    # Calcula SL e TP
-    if is_long:
-        sl = price - (atr_val * 1.2)
-        tp1 = price + (atr_val * 2.8)
-    else:
-        sl = price + (atr_val * 1.2)
-        tp1 = price - (atr_val * 2.8)
-    
-    # Calcula tamanho
-    notional = margem * alavancagem
-    if notional > MAX_NOTIONAL:
-        send(f"⚠️ Notional ${notional:.0f} > ${MAX_NOTIONAL}"); return
-    
-    size = calc_size(notional, price, par)
-    
-    # Valida
-    if check_open_position(par):
-        send(f"⚠️ Já tem posição em {par}"); return
-    
-    # Set leverage
-    bg_set_leverage(par, alavancagem)
-    time.sleep(1)
-    
-    # Abre posição (50% TP + 50% Trailing)
-    r = bg_place_order(par, is_long, size, sl, tp1)
-    if r.get("code") != "00000":
-        send(f"❌ Erro: {r.get('msg','?')}"); return
-    
-    time.sleep(0.5)
-    
-    # Coloca trailing 50%
-    size_trail = size / 2
-    bg_place_trailing(par, is_long, size_trail, tp1, CALLBACK_RATIO)
-    
-    # Confirmação
-    risco = abs(sl - price) * size
-    ganho = abs(tp1 - price) * size
-    m = f"✅ <b>POSIÇÃO ABERTA!</b>\n━━━━━━━━━━━━━━━\n"
-    m += f"{'↑' if is_long else '↓'} <b>{par} {side}</b> (HÍBRIDO)\n"
-    m += f"💲 ${price:,.2f} | 🛑 ${sl:,.2f} | 🎯 ${tp1:,.2f}\n"
-    m += f"⚡ {alavancagem:.1f}x | 💰 ${margem:.2f} | 📏 ${notional:.0f}\n"
-    m += f"💔 Risco: ${risco:+.2f} | 💎 Ganho pot.: ${ganho:+.2f}"
-    send(m)
-    
-    posicoes_abertas_cache[par] = {'entrada': price, 'tempo_abertura': time.time(), 'modo': 'hibrido', 'sym': par.replace("USDT", ""), 'lado': side}
-
-def processar_manual_trade(text):
-    """Processa input do manual trade"""
-    if CHAT_ID not in manual_trade_state:
-        return False
-    
-    estado = manual_trade_state[CHAT_ID]
-    
-    # Step 1: PAR
-    if estado['step'] == 'par':
-        par = text.upper().strip()
-        if not par.endswith("USDT"):
-            par = par + "USDT"
-        
-        pares_validos = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT", "UNIUSDT", "ATOMUSDT", "LTCUSDT", "DOGEUSDT", "AAVEUSDT"]
-        if par not in pares_validos:
-            send(f"❌ {par} inválido!\nTenta: BTC, SOL, ETH, etc"); return True
-        
-        estado['par'] = par
-        estado['step'] = 'side'
-        send(f"✅ {par}\n\n↑ L (LONG) ou ↓ S (SHORT)?")
-        return True
-    
-    # Step 2: LONG/SHORT
-    elif estado['step'] == 'side':
-        side = text.upper().strip()
-        if side not in ['L', 'S']:
-            send("❌ Apenas L ou S!"); return True
-        
-        estado['side'] = 'LONG' if side == 'L' else 'SHORT'
-        estado['step'] = 'margem'
-        send(f"✅ {estado['side']}\n\n💰 Valor de margem?\n(ex: 50, 75, 100)")
-        return True
-    
-    # Step 3: MARGEM
-    elif estado['step'] == 'margem':
-        try:
-            margem = float(text.strip())
-            if margem <= 0:
-                send("❌ Valor > 0"); return True
-            
-            estado['margem'] = margem
-            estado['step'] = 'alav'
-            send(f"✅ ${margem:.2f}\n\n⚡ Alavancagem?\n(ex: 2, 3, 5, 10)")
-            return True
-        except:
-            send("❌ Valor inválido!"); return True
-    
-    # Step 4: ALAVANCAGEM
-    elif estado['step'] == 'alav':
-        try:
-            alav = float(text.strip())
-            if alav <= 0 or alav > 125:
-                send("❌ Entre 1 e 125"); return True
-            
-            estado['alavancagem'] = alav
-            
-            # Mostra resumo
-            par = estado['par']
-            side = estado['side']
-            margem = estado['margem']
-            notional = margem * alav
-            
-            if notional > MAX_NOTIONAL:
-                send(f"❌ Notional ${notional:.0f} > ${MAX_NOTIONAL}"); 
-                manual_trade_state.pop(CHAT_ID, None)
-                return True
-            
-            # Busca preço para resumo
-            try:
-                pair_kraken = par.replace("USDT", "USD")
-                td = requests.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair_kraken}, timeout=10).json()
-                t = td["result"][list(td["result"].keys())[0]]
-                price = float(t["c"][0])
-            except:
-                send("⚠️ Erro preço"); return True
-            
-            # Busca ATR
-            try:
-                od = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair_kraken, "interval": 60}, timeout=15).json()
-                ohlc = od["result"][list(od["result"].keys())[0]]
-                closes = [float(c[4]) for c in ohlc]
-                highs = [float(c[2]) for c in ohlc]
-                lows = [float(c[3]) for c in ohlc]
-                atr_val = atr(highs, lows, closes)
-            except:
-                atr_val = price * 0.01
-            
-            if side == 'LONG':
-                sl = price - (atr_val * 1.2)
-                tp1 = price + (atr_val * 2.8)
-            else:
-                sl = price + (atr_val * 1.2)
-                tp1 = price - (atr_val * 2.8)
-            
-            quantidade = notional / price
-            risco = abs(sl - price) * quantidade
-            ganho = abs(tp1 - price) * quantidade
-            dist_pct = abs(sl - price) / price * 100
-            
-            m = f"━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            m += f"✅ <b>RESUMO ENTRADA MANUAL</b>\n\n"
-            m += f"📊 <b>{par} {side}</b> (HÍBRIDO)\n"
-            m += f"💲 ${price:,.2f} | 🛑 ${sl:,.2f} (-{dist_pct:.2f}%)\n"
-            m += f"🎯 TP1: ${tp1:,.2f}\n"
-            m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            m += f"💰 Margem: ${margem:.2f} | ⚡ {alav:.1f}x\n"
-            m += f"📏 Notional: ${notional:.2f}\n"
-            m += f"📊 Quantidade: {quantidade:.6f}\n"
-            m += f"💔 Risco: ${risco:+.2f} | 💎 Ganho pot: ${ganho:+.2f}\n"
-            m += "━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            m += f"⚠️ <b>Queres entrar?</b>"
-            
-            estado['price'] = price
-            estado['sl'] = sl
-            estado['tp1'] = tp1
-            
-            buttons = [
-                [{"text": "✅ CONFIRMAR", "callback_data": "mt_confirmar"}],
-                [{"text": "❌ CANCELAR", "callback_data": "mt_cancelar"}]
-            ]
-            
-            send_with_buttons(m, buttons)
-            return True
-        except:
-            send("❌ Inválido!"); return True
-    
-    return False
-
 def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
     m += "/saldo /posicoes /ganhos /stats\n"
@@ -1326,6 +1123,101 @@ def fechar_posicao_callback(symbol):
     else: 
         send(f"❌ Erro: {close_r.get('msg','?')}")
 
+def mt_ini():
+    """Inicia /mt"""
+    send("📊 <b>MANUAL TRADE</b>\n━━━━━━━━━\n\n🔤 Qual PAR?\n(BTC, SOL, ETH, etc)")
+    manual_trade_state[CHAT_ID] = {'step': 1}
+
+def mt_proc(txt):
+    """Processa MT"""
+    if CHAT_ID not in manual_trade_state: return False
+    s = manual_trade_state[CHAT_ID]
+    
+    # Step 1: PAR
+    if s['step'] == 1:
+        par = txt.upper().strip()
+        if not par.endswith("USDT"): par += "USDT"
+        pares = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT", "UNIUSDT", "ATOMUSDT", "LTCUSDT", "DOGEUSDT", "AAVEUSDT"]
+        if par not in pares:
+            send(f"❌ {par} inválido"); return True
+        s['par'] = par
+        s['step'] = 2
+        send(f"✅ {par}\n\n↑ L (LONG) ou ↓ S (SHORT)?")
+        return True
+    
+    # Step 2: L/S
+    if s['step'] == 2:
+        if txt.upper() not in ['L', 'S']:
+            send("❌ Apenas L ou S"); return True
+        s['side'] = 'LONG' if txt.upper() == 'L' else 'SHORT'
+        s['step'] = 3
+        send(f"✅ {s['side']}\n\n💰 Margem? (50, 75, 100)")
+        return True
+    
+    # Step 3: Margem
+    if s['step'] == 3:
+        try:
+            m = float(txt)
+            if m <= 0: send("❌ > 0"); return True
+            s['m'] = m
+            s['step'] = 4
+            send(f"✅ ${m:.2f}\n\n⚡ Alavancagem? (2, 3, 5, 10)")
+            return True
+        except:
+            send("❌ Inválido"); return True
+    
+    # Step 4: Alav
+    if s['step'] == 4:
+        try:
+            a = float(txt)
+            if a <= 0 or a > 125:
+                send("❌ Entre 1-125"); return True
+            
+            s['a'] = a
+            not_val = s['m'] * a
+            if not_val > MAX_NOTIONAL:
+                send(f"❌ ${not_val:.0f} > ${MAX_NOTIONAL}"); 
+                manual_trade_state.pop(CHAT_ID, None)
+                return True
+            
+            msg = f"━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"✅ <b>RESUMO</b>\n\n"
+            msg += f"📊 <b>{s['par']} {s['side']}</b> (HÍBRIDO)\n"
+            msg += f"💰 Margem: ${s['m']:.2f}\n"
+            msg += f"⚡ Alav: {a:.1f}x\n"
+            msg += f"📏 Notional: ${not_val:.2f}\n"
+            msg += "━━━━━━━━━━━━━━━━━━━━\n"
+            msg += f"⚠️ <b>Queres entrar?</b>"
+            
+            buttons = [
+                [{"text": "✅ CONFIRMAR", "callback_data": "mt_ok"}],
+                [{"text": "❌ CANCELAR", "callback_data": "mt_no"}]
+            ]
+            
+            send_with_buttons(msg, buttons)
+            return True
+        except:
+            send("❌ Inválido"); return True
+    
+    return False
+
+def mt_exec():
+    """Executa MT - abre posição"""
+    if CHAT_ID not in manual_trade_state: return
+    s = manual_trade_state[CHAT_ID]
+    
+    send(f"⏳ Abrindo {s['par']} {s['side']}...")
+    time.sleep(1)
+    
+    # Usa o executar_trade existente!
+    label = f"🟢 LONG MANUAL" if s['side'] == 'LONG' else f"🔴 SHORT MANUAL"
+    sig = (s['par'].replace("USDT", ""), 0, 0, 0, label, 0, {}, [], 0)
+    
+    # Chama com tamanho customizado
+    executar_trade(sig, s['par'], s['m'], "hibrido", "margem")
+    
+    manual_trade_state.pop(CHAT_ID, None)
+
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -1336,15 +1228,11 @@ def process_replies():
             callback = u["callback_query"]
             callback_data = callback.get("data", "")
             
-            if callback_data.startswith("mt_confirmar"):
-                if CHAT_ID in manual_trade_state:
-                    estado = manual_trade_state[CHAT_ID]
-                    send(f"⏳ Abrindo {estado['par']} {estado['side']}...")
-                    executar_manual_trade(estado['par'], estado['side'], estado['margem'], estado['alavancagem'])
-                    manual_trade_state.pop(CHAT_ID, None)
+            if callback_data == "mt_ok":
+                mt_exec()
                 continue
             
-            if callback_data.startswith("mt_cancelar"):
+            if callback_data == "mt_no":
                 send("❌ Cancelado")
                 manual_trade_state.pop(CHAT_ID, None)
                 continue
@@ -1358,7 +1246,7 @@ def process_replies():
         if not text: continue
         if text.startswith("/teste"):
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
-        if text.startswith("/mt"): iniciar_manual_trade(); continue
+        if text.startswith("/mt"): mt_ini(); continue
         if text.startswith("/saldo"): mostrar_saldo(); continue
         if text.startswith("/posicoes") or text.startswith("/posições"): mostrar_posicoes(); continue
         if text.startswith("/ganhos"):
@@ -1387,10 +1275,9 @@ def process_replies():
             menu_fechar(); continue
         if text.startswith("/ajuda") or text.startswith("/start"): mostrar_ajuda(); continue
         if text.startswith("/"): continue
-        # Processamento de Manual Trade
+        # MT processing
         if CHAT_ID in manual_trade_state:
-            if processar_manual_trade(text):
-                continue
+            if mt_proc(text): continue
         
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
