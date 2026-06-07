@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.20"
+VERSAO = "v5.21"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -163,13 +163,27 @@ def bg_request(method, path, params=None):
         return {"code":"99999","msg":str(e)}
 
 # ==================== PARES + PRECISAO ====================
+# ===== PARES VALIDADOS (v5.21) =====
+# Apos backtest + validacao out-of-sample em 2 periodos de ~42 dias, so estes
+# 4 pares foram lucrativos nos DOIS periodos (edge consistente, nao sorte):
+#   BTC (PF 1.18/1.58), XRP (2.39/5.03), UNI (1.60/1.20), ATOM (1.34/1.42)
+# Os restantes 8 ficam comentados abaixo:
+#   - DOT, DOGE: bons so no periodo recente (suspeita de over-fitting)
+#   - ADA, SOL, ETH: negativos nos dois periodos (sem edge)
+#   - LINK, AAVE: instaveis (bons num periodo, maus no outro)
+#   - LTC: nao passou nos criterios
+# Para reativar: descomentar a linha. Revalidar periodicamente (mercados mudam).
 ORIGINAL_PAIRS = [
-    ("XBTUSD","BTC","BTCUSDT"),("ETHUSD","ETH","ETHUSDT"),
-    ("SOLUSD","SOL","SOLUSDT"),("XRPUSD","XRP","XRPUSDT"),
-    ("ADAUSD","ADA","ADAUSDT"),("DOTUSDT","DOT","DOTUSDT"),
-    ("LINKUSD","LINK","LINKUSDT"),("UNIUSD","UNI","UNIUSDT"),
-    ("ATOMUSD","ATOM","ATOMUSDT"),("LTCUSD","LTC","LTCUSDT"),
-    ("XDGUSD","DOGE","DOGEUSDT"),("AAVEUSD","AAVE","AAVEUSDT")
+    ("XBTUSD","BTC","BTCUSDT"),  ("XRPUSD","XRP","XRPUSDT"),
+    ("UNIUSD","UNI","UNIUSDT"),  ("ATOMUSD","ATOM","ATOMUSDT"),
+    # ("ETHUSD","ETH","ETHUSDT"),     # excluido: PF 0.44/0.71 (sem edge)
+    # ("SOLUSD","SOL","SOLUSDT"),     # excluido: PF 0.40/0.63 (sem edge)
+    # ("ADAUSD","ADA","ADAUSDT"),     # excluido: PF 0.00/0.38 (sem edge)
+    # ("DOTUSDT","DOT","DOTUSDT"),    # so recente: PF 0.00/1.13 (over-fit?)
+    # ("LINKUSD","LINK","LINKUSDT"),  # instavel: PF 1.93/0.32 (piorou)
+    # ("LTCUSD","LTC","LTCUSDT"),     # nao validado
+    # ("XDGUSD","DOGE","DOGEUSDT"),   # so recente: PF 0.80/1.10 (over-fit?)
+    # ("AAVEUSD","AAVE","AAVEUSDT"),  # instavel: PF 1.27/0.78 (piorou)
 ]
 
 def get_dynamic_pairs():
@@ -1813,7 +1827,7 @@ if not DRY_RUN:
     reconciliar_posicoes()
 
 sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
 _dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
 while True:
