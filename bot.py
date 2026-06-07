@@ -281,12 +281,25 @@ def bg_set_position_tpsl(symbol, hold_side, sl_price, tp_price):
         "stopLossTriggerPrice": str(sl_price), "stopLossTriggerType": "mark_price",
     })
 
+def bg_set_position_sl(symbol, hold_side, sl_price):
+    """Coloca SO um stop loss de posicao inteira (planType=pos_loss).
+    Nao mexe em TPs parciais existentes (modo hibrido). holdSide: 'long'/'short'."""
+    return bg_request("POST", "/api/v2/mix/order/place-tpsl-order", {
+        "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT",
+        "planType": "pos_loss", "holdSide": hold_side,
+        "triggerPrice": str(sl_price), "triggerType": "mark_price",
+        "executePrice": "0",  # 0 = executa a mercado quando dispara
+        "clientOid": gen_oid()
+    })
+
 def bg_get_position_tpsl(symbol):
-    """Verifica se uma posicao ja tem plan orders TP/SL (profit_plan/loss_plan).
-    Retorna True se tiver pelo menos um SL ou TP de posicao."""
+    """Verifica se uma posicao tem STOP LOSS de posicao ativo.
+    Usa planType=pos_loss (so stop losses de posicao inteira), NAO profit_loss
+    (que tambem apanha TPs parciais do modo hibrido e dava falso positivo).
+    Retorna True so se houver um stop loss real a cobrir a posicao."""
     try:
         resp = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
-                          {"productType":"USDT-FUTURES", "planType":"profit_loss"})
+                          {"productType":"USDT-FUTURES", "planType":"pos_loss"})
         if resp.get("code") == "00000":
             d = resp.get("data")
             lista = (d.get("entrustedList") or d.get("list") or []) if isinstance(d, dict) else (d or [])
@@ -480,16 +493,16 @@ def reconciliar_posicoes():
                 side = "🟢" if hold=="long" else "🔴"
                 upl = float(p.get("unrealizedPL",0))
 
-                # ===== PROTECAO SL/TP (v5.19) =====
-                # Só protege posicoes SEM SL/TP. SL/TP calculado a partir do PRECO ATUAL.
+                # ===== PROTECAO SL (v5.20): coloca SO stop loss, nao mexe em TPs =====
+                # Só protege posicoes SEM stop loss. SL calculado a partir do PRECO ATUAL.
                 protecao = ""
                 try:
                     if bg_get_position_tpsl(bgsym):
-                        protecao = " (já protegida)"
+                        protecao = " (SL já existe)"
                     else:
                         price_atual, _ = bg_get_ticker(bgsym)
                         if price_atual:
-                            # ATR atual do par para dimensionar o SL/TP
+                            # ATR atual do par para dimensionar o SL
                             candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
                             if candles:
                                 highs = [float(c[2]) for c in candles]
@@ -499,15 +512,15 @@ def reconciliar_posicoes():
                             else:
                                 atr_val = price_atual * 0.01
                             label = "LONG" if hold=="long" else "SHORT"
-                            sl, tp1, _, _ = calc_levels(price_atual, label, atr_val)
-                            sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
-                            r_tpsl = bg_set_position_tpsl(bgsym, hold, sl, tp1)
-                            if r_tpsl.get("code") == "00000":
-                                protecao = f" ✅ SL ${fmt(sl)} / TP ${fmt(tp1)}"
-                                print(f"✅ Protegida {bgsym}: SL={sl} TP={tp1}")
+                            sl, _, _, _ = calc_levels(price_atual, label, atr_val)
+                            sl = round_price(sl, bgsym)
+                            r_sl = bg_set_position_sl(bgsym, hold, sl)
+                            if r_sl.get("code") == "00000":
+                                protecao = f" ✅ SL colocado ${fmt(sl)}"
+                                print(f"✅ SL protegido {bgsym}: {sl}")
                             else:
-                                protecao = f" ⚠️ proteção falhou ({r_tpsl.get('msg','?')})"
-                                print(f"⚠️ Falha proteger {bgsym}: {r_tpsl.get('msg')}")
+                                protecao = f" ⚠️ SL falhou ({r_sl.get('msg','?')})"
+                                print(f"⚠️ Falha SL {bgsym}: {r_sl.get('msg')}")
                         time.sleep(0.5)  # respeitar rate limit
                 except Exception as e:
                     protecao = " ⚠️ erro proteção"
