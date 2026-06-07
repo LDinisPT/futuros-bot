@@ -500,40 +500,10 @@ def reconciliar_posicoes():
                 side = "🟢" if hold=="long" else "🔴"
                 upl = float(p.get("unrealizedPL",0))
 
-                # ===== PROTECAO SL (v5.20): coloca SO stop loss, nao mexe em TPs =====
-                # Só protege posicoes SEM stop loss. SL calculado a partir do PRECO ATUAL.
+                # Reconciliacao lista as posicoes recuperadas (sem tocar em SL/TP).
+                # Auto-protecao removida: protecao de posicoes orfas faz-se manualmente
+                # na Bitget (particularidades do one-way mode + hibrido tornam-na fragil).
                 protecao = ""
-                try:
-                    if bg_get_position_tpsl(bgsym):
-                        protecao = " (SL já existe)"
-                    else:
-                        price_atual, _ = bg_get_ticker(bgsym)
-                        if price_atual:
-                            # ATR atual do par para dimensionar o SL
-                            candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
-                            if candles:
-                                highs = [float(c[2]) for c in candles]
-                                lows = [float(c[3]) for c in candles]
-                                closes = [float(c[4]) for c in candles]
-                                atr_val = atr(highs, lows, closes)
-                            else:
-                                atr_val = price_atual * 0.01
-                            label = "LONG" if hold=="long" else "SHORT"
-                            sl, _, _, _ = calc_levels(price_atual, label, atr_val)
-                            sl = round_price(sl, bgsym)
-                            pos_size = float(p.get("total", 0))
-                            is_long_pos = (hold == "long")
-                            r_sl = bg_set_position_sl(bgsym, is_long_pos, pos_size, sl)
-                            if r_sl.get("code") == "00000":
-                                protecao = f" ✅ SL colocado ${fmt(sl)}"
-                                print(f"✅ SL protegido {bgsym}: {sl}")
-                            else:
-                                protecao = f" ⚠️ SL falhou ({r_sl.get('msg','?')})"
-                                print(f"⚠️ Falha SL {bgsym}: {r_sl.get('msg')}")
-                        time.sleep(0.5)  # respeitar rate limit
-                except Exception as e:
-                    protecao = " ⚠️ erro proteção"
-                    print(f"Erro proteger {bgsym}: {e}")
 
                 linhas.append(f"{side} {sym}: ${upl:+.4f}{protecao}")
             send(f"🔄 <b>RECONCILIAÇÃO</b>\n━━━━━━━━━━━━━━━\n"
