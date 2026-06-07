@@ -281,31 +281,38 @@ def bg_set_position_tpsl(symbol, hold_side, sl_price, tp_price):
         "stopLossTriggerPrice": str(sl_price), "stopLossTriggerType": "mark_price",
     })
 
-def bg_set_position_sl(symbol, hold_side, sl_price):
-    """Coloca SO um stop loss de posicao inteira (planType=pos_loss).
-    Nao mexe em TPs parciais existentes (modo hibrido). holdSide: 'long'/'short'."""
-    return bg_request("POST", "/api/v2/mix/order/place-tpsl-order", {
-        "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT",
-        "planType": "pos_loss", "holdSide": hold_side,
+def bg_set_position_sl(symbol, is_long, size, sl_price):
+    """Coloca um stop loss numa posicao aberta via place-plan-order.
+    Usa o MESMO formato do trailing que ja funciona: side invertido + reduceOnly,
+    SEM holdSide (que dava erro de specification em one-way mode).
+    is_long: True se a posicao e LONG. size: tamanho da posicao a proteger."""
+    side = "sell" if is_long else "buy"  # fecha a posicao na direcao oposta
+    return bg_request("POST", "/api/v2/mix/order/place-plan-order", {
+        "planType": "normal_plan", "symbol": symbol, "productType": "USDT-FUTURES",
+        "marginMode": "isolated", "marginCoin": "USDT", "size": str(size),
         "triggerPrice": str(sl_price), "triggerType": "mark_price",
-        "executePrice": "0",  # 0 = executa a mercado quando dispara
+        "side": side, "reduceOnly": "YES", "orderType": "market",
         "clientOid": gen_oid()
     })
 
 def bg_get_position_tpsl(symbol):
-    """Verifica se uma posicao tem STOP LOSS de posicao ativo.
-    Usa planType=pos_loss (so stop losses de posicao inteira), NAO profit_loss
-    (que tambem apanha TPs parciais do modo hibrido e dava falso positivo).
-    Retorna True so se houver um stop loss real a cobrir a posicao."""
+    """Verifica se uma posicao ja tem um stop loss colocado pelo bot.
+    O SL e colocado como normal_plan reduceOnly (ver bg_set_position_sl), por isso
+    procuramos plan orders normais reduceOnly para este simbolo.
+    Tambem verifica track_plan (trailing) que ja serve de protecao."""
     try:
-        resp = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
-                          {"productType":"USDT-FUTURES", "planType":"pos_loss"})
-        if resp.get("code") == "00000":
-            d = resp.get("data")
-            lista = (d.get("entrustedList") or d.get("list") or []) if isinstance(d, dict) else (d or [])
-            for o in (lista or []):
-                if o.get("symbol") == symbol:
-                    return True
+        for ptype in ("normal_plan", "track_plan"):
+            resp = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
+                              {"productType":"USDT-FUTURES", "planType":ptype})
+            if resp.get("code") == "00000":
+                d = resp.get("data")
+                lista = (d.get("entrustedList") or d.get("list") or []) if isinstance(d, dict) else (d or [])
+                for o in (lista or []):
+                    if o.get("symbol") == symbol:
+                        # reduceOnly indica ordem de fecho (protecao), nao de entrada
+                        ro = str(o.get("reduceOnly","")).upper()
+                        if ro in ("YES","TRUE","1") or ptype == "track_plan":
+                            return True
     except Exception as e:
         print(f"Erro bg_get_position_tpsl {symbol}: {e}")
     return False
@@ -514,7 +521,9 @@ def reconciliar_posicoes():
                             label = "LONG" if hold=="long" else "SHORT"
                             sl, _, _, _ = calc_levels(price_atual, label, atr_val)
                             sl = round_price(sl, bgsym)
-                            r_sl = bg_set_position_sl(bgsym, hold, sl)
+                            pos_size = float(p.get("total", 0))
+                            is_long_pos = (hold == "long")
+                            r_sl = bg_set_position_sl(bgsym, is_long_pos, pos_size, sl)
                             if r_sl.get("code") == "00000":
                                 protecao = f" ✅ SL colocado ${fmt(sl)}"
                                 print(f"✅ SL protegido {bgsym}: {sl}")
