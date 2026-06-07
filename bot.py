@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.19"
+VERSAO = "v5.20"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -271,6 +271,32 @@ def bg_close_position(symbol):
         "symbol": symbol, "productType": "USDT-FUTURES"
     })
 
+def bg_set_position_tpsl(symbol, hold_side, sl_price, tp_price):
+    """Coloca SL+TP numa posicao JA aberta (place-pos-tpsl).
+    hold_side: 'long' ou 'short'. Retorna o dict de resposta."""
+    return bg_request("POST", "/api/v2/mix/order/place-pos-tpsl", {
+        "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT",
+        "holdSide": hold_side,
+        "stopSurplusTriggerPrice": str(tp_price), "stopSurplusTriggerType": "mark_price",
+        "stopLossTriggerPrice": str(sl_price), "stopLossTriggerType": "mark_price",
+    })
+
+def bg_get_position_tpsl(symbol):
+    """Verifica se uma posicao ja tem plan orders TP/SL (profit_plan/loss_plan).
+    Retorna True se tiver pelo menos um SL ou TP de posicao."""
+    try:
+        resp = bg_request("GET", "/api/v2/mix/order/orders-plan-pending",
+                          {"productType":"USDT-FUTURES", "planType":"profit_loss"})
+        if resp.get("code") == "00000":
+            d = resp.get("data")
+            lista = (d.get("entrustedList") or d.get("list") or []) if isinstance(d, dict) else (d or [])
+            for o in (lista or []):
+                if o.get("symbol") == symbol:
+                    return True
+    except Exception as e:
+        print(f"Erro bg_get_position_tpsl {symbol}: {e}")
+    return False
+
 def bg_cancel_all(symbol):
     return bg_request("POST", "/api/v2/mix/order/cancel-all-orders", {
         "symbol": symbol, "productType": "USDT-FUTURES", "marginCoin": "USDT"
@@ -449,9 +475,45 @@ def reconciliar_posicoes():
             linhas = []
             for p in reais:
                 sym = p.get("symbol","?")
-                side = "🟢" if p.get("holdSide")=="long" else "🔴"
+                bgsym = sym
+                hold = p.get("holdSide","long")
+                side = "🟢" if hold=="long" else "🔴"
                 upl = float(p.get("unrealizedPL",0))
-                linhas.append(f"{side} {sym}: ${upl:+.4f}")
+
+                # ===== PROTECAO SL/TP (v5.19) =====
+                # Só protege posicoes SEM SL/TP. SL/TP calculado a partir do PRECO ATUAL.
+                protecao = ""
+                try:
+                    if bg_get_position_tpsl(bgsym):
+                        protecao = " (já protegida)"
+                    else:
+                        price_atual, _ = bg_get_ticker(bgsym)
+                        if price_atual:
+                            # ATR atual do par para dimensionar o SL/TP
+                            candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
+                            if candles:
+                                highs = [float(c[2]) for c in candles]
+                                lows = [float(c[3]) for c in candles]
+                                closes = [float(c[4]) for c in candles]
+                                atr_val = atr(highs, lows, closes)
+                            else:
+                                atr_val = price_atual * 0.01
+                            label = "LONG" if hold=="long" else "SHORT"
+                            sl, tp1, _, _ = calc_levels(price_atual, label, atr_val)
+                            sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
+                            r_tpsl = bg_set_position_tpsl(bgsym, hold, sl, tp1)
+                            if r_tpsl.get("code") == "00000":
+                                protecao = f" ✅ SL ${fmt(sl)} / TP ${fmt(tp1)}"
+                                print(f"✅ Protegida {bgsym}: SL={sl} TP={tp1}")
+                            else:
+                                protecao = f" ⚠️ proteção falhou ({r_tpsl.get('msg','?')})"
+                                print(f"⚠️ Falha proteger {bgsym}: {r_tpsl.get('msg')}")
+                        time.sleep(0.5)  # respeitar rate limit
+                except Exception as e:
+                    protecao = " ⚠️ erro proteção"
+                    print(f"Erro proteger {bgsym}: {e}")
+
+                linhas.append(f"{side} {sym}: ${upl:+.4f}{protecao}")
             send(f"🔄 <b>RECONCILIAÇÃO</b>\n━━━━━━━━━━━━━━━\n"
                  f"Recuperadas {len(reais)} posição(ões) abertas:\n" + "\n".join(linhas))
             print(f"✅ Reconciliacao: {len(reais)} posicoes recuperadas")
