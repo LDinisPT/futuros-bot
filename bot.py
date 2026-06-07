@@ -394,6 +394,34 @@ def calc_valor_risco():
         return None
     return round(equity * (RISK_PCT / 100), 2)
 
+def resumo_pos_saldo():
+    """Texto compacto com saldo + posicoes abertas. Para mostrar apos uma entrada."""
+    linhas = []
+    # Saldo
+    equity, avail = get_saldo()
+    if equity > 0:
+        perda = perda_hoje()
+        linhas.append(f"💰 <b>Saldo:</b> ${equity:.2f} | Disp: ${avail:.2f} | Hoje: ${perda:+.2f}")
+    # Posicoes abertas
+    try:
+        resp = bg_request("GET", "/api/v2/mix/position/all-position",
+                          {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+        pos = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0] if resp.get("code")=="00000" else []
+        if pos:
+            linhas.append(f"📊 <b>Posições abertas ({len(pos)}):</b>")
+            for p in pos:
+                sym = p.get("symbol","?")
+                emoji = "🟢" if p.get("holdSide")=="long" else "🔴"
+                upl = float(p.get("unrealizedPL",0))
+                marg = float(p.get("marginSize",0))
+                roe = (upl/marg*100) if marg else 0
+                linhas.append(f"  {emoji} {sym}: ${upl:+.4f} ({roe:+.1f}%)")
+        else:
+            linhas.append("📊 Sem outras posições abertas")
+    except Exception as e:
+        print(f"Erro resumo_pos_saldo: {e}")
+    return "\n".join(linhas)
+
 def reconciliar_posicoes():
     """No arranque: sincroniza o cache com as posicoes reais da Bitget.
     Resolve perda de estado em restarts do Railway."""
@@ -507,7 +535,10 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
     m += f"{arrow} <b>{sym}/USDT — {direcao}</b>\n💲 Entrada: ~${fmt(price)}\n"
     m += f"⚡ {lev}x | 💰 Margem ${margem:.2f}\n📊 Size: {size}\n"
     m += f"🛑 SL: ${fmt(sl)} | 🎯 TP1: ${fmt(tp1)}\n"
-    m += f"📉 Risco: <b>${risco_real:.2f}</b>\n📋 {extra}\n━━━━━━━━━━━━━━━"
+    m += f"📉 Risco: <b>${risco_real:.2f}</b>\n📋 {extra}\n━━━━━━━━━━━━━━━\n"
+    # Resumo de saldo + posicoes apos a entrada (v5.19)
+    time.sleep(1)  # da tempo a Bitget refletir a nova posicao
+    m += resumo_pos_saldo()
     send(m)
     
     posicoes_abertas_cache[bgsym] = {
