@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.21"
+VERSAO = "v5.22"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -163,7 +163,7 @@ def bg_request(method, path, params=None):
         return {"code":"99999","msg":str(e)}
 
 # ==================== PARES + PRECISAO ====================
-# ===== PARES VALIDADOS (v5.21) =====
+# ===== PARES VALIDADOS (v5.22) =====
 # Apos backtest + validacao out-of-sample em 2 periodos de ~42 dias, so estes
 # 4 pares foram lucrativos nos DOIS periodos (edge consistente, nao sorte):
 #   BTC (PF 1.18/1.58), XRP (2.39/5.03), UNI (1.60/1.20), ATOM (1.34/1.42)
