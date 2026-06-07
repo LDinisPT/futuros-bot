@@ -15,12 +15,19 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.17"
+VERSAO = "v5.18"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 SL_MIN_PCT = 0.6  # SL minimo: 0.6% da entrada (evita stops colados em mercado calmo)
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
+
+# ===== QUALIDADE DE SINAL (v5.18) =====
+SCORE_AUTO = 7.0          # antes 6.0 - threshold de entrada automatica
+SCORE_MANUAL = 5.0        # antes 4.0 - threshold de sinal manual
+MIN_CATEGORIAS = 3        # nº minimo de CATEGORIAS diferentes a concordar (confluencia real)
+COOLDOWN_MIN = 30         # minutos sem repetir sinal do mesmo par
+ultimo_sinal_par = {}     # {bgsym: timestamp} - controla cooldown
 
 pending = {}
 last_update_id = 0
@@ -733,19 +740,52 @@ def analyze():
             
             # Arredonda score para 1 decimal
             score = round(score, 1)
-            
+
+            # ===== CONFLUENCIA POR CATEGORIAS (v5.18) =====
+            # Agrupa indicadores em 4 familias independentes. Conta quantas
+            # CATEGORIAS apontam na mesma direcao do score (sinal real != soma inflada
+            # por 2 indicadores da mesma familia, ex: EMA + MACD que medem ambos tendencia)
+            direcao = 1 if score > 0 else -1
+            categorias = {
+                'tendencia': ema_score + macd_score,                 # EMA + MACD
+                'momento':   rsi_score,                              # RSI
+                'volume':    vol_score,                              # Volume
+                'contexto':  funding_score + pattern_score,          # Funding + Padroes
+            }
+            cats_concordam = sum(1 for v in categorias.values() if v != 0 and (1 if v > 0 else -1) == direcao)
+
+            # Guarda para diagnostico
+            score_breakdown['_cats'] = cats_concordam
+
+            print(f"{sym}: RSI={r:.1f} score={score:+.1f} cats={cats_concordam} funding={funding:+.3%}")
+
+            # ===== FILTROS DE QUALIDADE (v5.18) =====
+            # 1. Confluencia minima: precisa de MIN_CATEGORIAS familias a concordar
+            if abs(score) >= SCORE_MANUAL and cats_concordam < MIN_CATEGORIAS:
+                print(f"  ⏭️ {sym} rejeitado: so {cats_concordam} categorias (min {MIN_CATEGORIAS})")
+                continue
+
+            # 2. Cooldown por par: nao repetir sinal do mesmo par dentro de COOLDOWN_MIN
+            ultimo = ultimo_sinal_par.get(bgsym, 0)
+            if abs(score) >= SCORE_MANUAL and (time.time() - ultimo) < COOLDOWN_MIN * 60:
+                restante = int((COOLDOWN_MIN*60 - (time.time()-ultimo)) / 60)
+                print(f"  ⏭️ {sym} em cooldown ({restante}min restantes)")
+                continue
+
             # SIGNALS
-            if score >= 6.0:
+            if score >= SCORE_AUTO:
+                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🟢 LONG MUITO FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "AUTO"))
-            elif score <= -6.0:
+            elif score <= -SCORE_AUTO:
+                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🔴 SHORT MUITO FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "AUTO"))
-            elif score >= 4.0:
+            elif score >= SCORE_MANUAL:
+                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🟢 LONG FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "MANUAL"))
-            elif score <= -4.0:
+            elif score <= -SCORE_MANUAL:
+                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🔴 SHORT FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "MANUAL"))
-            
-            print(f"{sym}: RSI={r:.1f} score={score:+.1f} funding={funding:+.3%}")
-            
+
         except Exception as e:
             print(f"Erro analyze {sym}: {e}")
             continue
@@ -761,10 +801,14 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
     confianca = min(95, 50 + (abs(score) * 10))
     
     # Breakdown string
+    cats = score_breakdown.get('_cats', 0)
     breakdown_str = "Breakdown:\n"
     for indicador, valor in score_breakdown.items():
+        if indicador == '_cats':
+            continue
         sinal = "+" if valor >= 0 else ""
         breakdown_str += f"  {indicador}: {sinal}{valor:.1f}\n"
+    breakdown_str += f"  🔗 Confluência: {cats}/4 categorias\n"
     
     if tipo == "AUTO":
         # ENTRADA AUTOMÁTICA (score >= 6)
@@ -1575,7 +1619,7 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ 6 entra $50 hibrido\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra $50 hibrido\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
 while True:
     process_replies()
