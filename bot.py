@@ -15,12 +15,18 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.18"
+VERSAO = "v5.19"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 SL_MIN_PCT = 0.6  # SL minimo: 0.6% da entrada (evita stops colados em mercado calmo)
 ANALYSIS_INTERVAL = 900  # 900 segundos = 15 minutos
+
+# ===== GESTAO DE RISCO (v5.19) =====
+DAILY_LOSS_LIMIT = 15.0   # circuit breaker: bloqueia novas entradas se perda do dia >= este valor ($)
+RISK_PCT = 1.0            # % do saldo a arriscar por trade (sizing automatico)
+RISK_AUTO_ENABLED = True  # True = entradas AUTO usam sizing por risco; False = usa $50 margem fixa
+circuit_breaker_avisado = False  # evita spam do aviso de circuit breaker
 
 # ===== QUALIDADE DE SINAL (v5.18) =====
 SCORE_AUTO = 7.0          # antes 6.0 - threshold de entrada automatica
@@ -351,6 +357,81 @@ def count_trades_hoje():
         if data_fecho == hoje:
             count += 1
     return count
+
+# ==================== GESTAO DE RISCO (v5.19) ====================
+def get_saldo():
+    """Retorna (equity, disponivel) da conta de futuros. (0,0) em erro."""
+    try:
+        resp = bg_request("GET", "/api/v2/mix/account/accounts", {"productType":"USDT-FUTURES"})
+        if resp.get("code") == "00000" and resp.get("data"):
+            a = resp["data"][0]
+            equity = float(a.get("accountEquity", a.get("usdtEquity", 0)))
+            avail = float(a.get("available", 0))
+            return equity, avail
+    except Exception as e:
+        print(f"Erro get_saldo: {e}")
+    return 0.0, 0.0
+
+def circuit_breaker_ativo():
+    """True se a perda do dia atingiu o limite. Bloqueia novas entradas."""
+    global circuit_breaker_avisado
+    perda = perda_hoje()
+    if perda <= -DAILY_LOSS_LIMIT:
+        if not circuit_breaker_avisado:
+            send(f"🚨 <b>CIRCUIT BREAKER ATIVO</b>\n━━━━━━━━━━━━━━━\n"
+                 f"📉 Perda hoje: <b>${perda:.2f}</b>\n"
+                 f"🛑 Limite: ${DAILY_LOSS_LIMIT:.2f}\n\n"
+                 f"<b>Novas entradas BLOQUEADAS até amanhã (UTC).</b>\n"
+                 f"As posições abertas continuam a ser geridas normalmente.")
+            circuit_breaker_avisado = True
+        return True
+    return False
+
+def calc_valor_risco():
+    """Calcula o valor a arriscar ($) com base em RISK_PCT do equity."""
+    equity, _ = get_saldo()
+    if equity <= 0:
+        return None
+    return round(equity * (RISK_PCT / 100), 2)
+
+def reconciliar_posicoes():
+    """No arranque: sincroniza o cache com as posicoes reais da Bitget.
+    Resolve perda de estado em restarts do Railway."""
+    global posicoes_abertas_cache
+    try:
+        resp = bg_request("GET", "/api/v2/mix/position/all-position",
+                          {"productType":"USDT-FUTURES","marginCoin":"USDT"})
+        if resp.get("code") != "00000":
+            print(f"⚠️ Reconciliacao falhou: {resp.get('msg')}")
+            return
+        reais = [p for p in resp.get("data", []) if float(p.get("total",0)) > 0]
+        posicoes_abertas_cache = {}
+        for p in reais:
+            bgsym = p.get("symbol")
+            side = p.get("holdSide","?")
+            entrada = float(p.get("openPriceAvg") or p.get("averageOpenPrice") or 0)
+            posicoes_abertas_cache[bgsym] = {
+                "sym": bgsym.replace("USDT",""),
+                "lado": "LONG" if side=="long" else "SHORT",
+                "entrada": entrada,
+                "modo": "recuperado",
+                "tempo_abertura": time.time()  # desconhecido; assume agora
+            }
+        if reais:
+            linhas = []
+            for p in reais:
+                sym = p.get("symbol","?")
+                side = "🟢" if p.get("holdSide")=="long" else "🔴"
+                upl = float(p.get("unrealizedPL",0))
+                linhas.append(f"{side} {sym}: ${upl:+.4f}")
+            send(f"🔄 <b>RECONCILIAÇÃO</b>\n━━━━━━━━━━━━━━━\n"
+                 f"Recuperadas {len(reais)} posição(ões) abertas:\n" + "\n".join(linhas))
+            print(f"✅ Reconciliacao: {len(reais)} posicoes recuperadas")
+        else:
+            print("✅ Reconciliacao: sem posicoes abertas")
+    except Exception as e:
+        print(f"Erro reconciliar_posicoes: {e}")
+
 
 def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
     sym, price, _, rsi_v, label, score, score_breakdown, reasons, atr_val = sig
@@ -811,20 +892,37 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
     breakdown_str += f"  🔗 Confluência: {cats}/4 categorias\n"
     
     if tipo == "AUTO":
-        # ENTRADA AUTOMÁTICA (score >= 6)
+        # ===== CIRCUIT BREAKER (v5.19): bloqueia entrada automatica =====
+        if circuit_breaker_ativo():
+            print(f"🚨 {sym} AUTO bloqueado pelo circuit breaker")
+            return
+
+        # ===== SIZING POR RISCO (v5.19) =====
+        if RISK_AUTO_ENABLED:
+            valor_risco = calc_valor_risco()
+            if valor_risco and valor_risco > 0:
+                entrada_valor, entrada_tipo = valor_risco, "risco"
+                desc_entrada = f"risco ${valor_risco:.2f} ({RISK_PCT:.0f}% conta)"
+            else:
+                entrada_valor, entrada_tipo = 50, "margem"
+                desc_entrada = "$50 margem (saldo indisponível)"
+        else:
+            entrada_valor, entrada_tipo = 50, "margem"
+            desc_entrada = "$50 margem"
+
         cap  = f"⚡ <b>ENTRADA AUTOMÁTICA!</b>\n{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
         cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
         cap += f"━━━━━━━━━━━━━━━\n"
         cap += f"📉 RSI: {rsi_v} | <b>Score: {score:+.1f}</b> (Confiança: {confianca:.0f}%)\n"
         cap += breakdown_str
         cap += f"📌 {', '.join(reasons[:2])}\n"
-        cap += f"━━━━━━━━━━━━━━━\n✅ Bot entrou com $50 hibrido!"
+        cap += f"━━━━━━━━━━━━━━━\n✅ Bot entrou ({desc_entrada}, híbrido)!"
         pending[CHAT_ID] = None
         buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
         if buf: send_photo(buf, cap)
         else: send(cap)
-        # Executa automático
-        executar_trade(sig, bgsym, 50, "hibrido", "margem")
+        # Executa automático com sizing por risco
+        executar_trade(sig, bgsym, entrada_valor, "hibrido", entrada_tipo)
     else:
         # ENTRADA MANUAL (score 4-5 ou -4 a -5) COM BOTÕES
         cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
@@ -1605,6 +1703,11 @@ def process_replies():
                 if "trail" in resto or "t" in resto: modo = "trail"
                 if "hib" in resto or "h" in resto: modo = "hibrido"
                 if not has_conf and not DRY_RUN:
+                    # Circuit breaker (v5.19): bloqueio RIGIDO, nao contornavel com "confirmar"
+                    if circuit_breaker_ativo():
+                        send(f"🚨 <b>Entrada bloqueada</b> — circuit breaker ativo (perda diária ≥ ${DAILY_LOSS_LIMIT:.0f}).\nNovas entradas só amanhã (UTC).")
+                        pending.pop(CHAT_ID, None)
+                        continue
                     perda = perda_hoje()
                     if perda <= -DAILY_LOSS_WARNING:
                         send(f"⚠️ <b>Aviso:</b> já perdeste <b>${abs(perda):.2f}</b> hoje.\nPara entrar mesmo assim:\n<b>{text} confirmar</b>\nOu <b>não</b> para cancelar.")
@@ -1619,9 +1722,23 @@ def process_replies():
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
 print(f"Bot {VERSAO} — {estado}")
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra $50 hibrido\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
+# Reconciliacao no arranque (v5.19): recupera posicoes apos restart do Railway
+if not DRY_RUN:
+    reconciliar_posicoes()
+
+sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+
+_dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
 while True:
+    # Reset diario do circuit breaker (UTC)
+    _hoje = time.strftime("%Y-%m-%d", time.gmtime())
+    if _hoje != _dia_atual:
+        _dia_atual = _hoje
+        circuit_breaker_avisado = False
+        print(f"🔄 Novo dia UTC ({_hoje}) — circuit breaker reposto")
+
     process_replies()
     verificar_posicoes_fechadas()
     if time.time()-last_analysis >= ANALYSIS_INTERVAL:
