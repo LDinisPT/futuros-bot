@@ -42,6 +42,9 @@ last_position_check = 0
 posicoes_abertas_cache = {}
 trades_history = []  # Histórico de todos os trades fechados
 
+# ==================== OPEN INTEREST DELTA (v5.22) ====================
+oi_history = {}  # {bgsym: [(timestamp, oi_value), ...]} ~4h de histórico
+
 # ==================== BITGET MARKET DATA ====================
 def bg_get_ohlcv(bgsym, granularity="60", limit=200):
     """Busca velas OHLCV da Bitget Futures"""
@@ -386,6 +389,24 @@ def get_funding_rate(symbol):
     except:
         pass
     return 0
+
+def bg_get_open_interest(bgsym):
+    """Busca Open Interest atual da Bitget Futures"""
+    try:
+        resp = requests.get(
+            f"{BG_API}/api/v2/mix/market/open-interest",
+            params={"symbol": bgsym, "productType": "USDT-FUTURES"},
+            timeout=10
+        )
+        data = resp.json()
+        if data.get("code") == "00000" and data.get("data"):
+            oi_list = data["data"].get("openInterestList", [])
+            if oi_list:
+                return float(oi_list[0].get("size", 0))
+        return None
+    except Exception as e:
+        print(f"Erro bg_get_open_interest {bgsym}: {e}")
+        return None
 
 def perda_hoje():
     resp = bg_request("GET", "/api/v2/mix/position/history-position", {"productType":"USDT-FUTURES","limit":"100"})
@@ -918,6 +939,61 @@ def analyze():
             score += pattern_score
             score_breakdown['Padrões'] = pattern_score
             
+            # ==================== OPEN INTEREST DELTA (v5.22) - POSIÇÃO CORRETA ====================
+            # Calculado depois de todos os outros scores para usar direcao_sinal real
+            current_oi = bg_get_open_interest(bgsym)
+            oi_delta_4h = 0.0
+            oi_delta_1h = 0.0
+            oi_score = 0.0
+            
+            if current_oi is not None:
+                now = time.time()
+                if bgsym not in oi_history:
+                    oi_history[bgsym] = []
+                oi_history[bgsym].append((now, current_oi))
+                
+                # Manter apenas últimas ~4 horas
+                oi_history[bgsym] = [(ts, oi) for ts, oi in oi_history[bgsym] if now - ts < 14400]
+                
+                hist = oi_history[bgsym]
+                
+                if len(hist) >= 4:
+                    oldest_oi = hist[0][1]
+                    if oldest_oi > 0:
+                        oi_delta_4h = (current_oi - oldest_oi) / oldest_oi * 100
+                    
+                    if len(hist) >= 5:
+                        oi_1h_ago = hist[-5][1]
+                        if oi_1h_ago > 0:
+                            oi_delta_1h = (current_oi - oi_1h_ago) / oi_1h_ago * 100
+                    
+                    direcao_sinal = 1 if score > 0 else -1
+                    
+                    # Confirmação forte
+                    if oi_delta_4h > 6 and direcao_sinal > 0:
+                        oi_score = 1.5
+                        reasons.append(f"OI Δ4h ↑ +{oi_delta_4h:.1f}% ✅")
+                    elif oi_delta_4h < -6 and direcao_sinal < 0:
+                        oi_score = 1.5
+                        reasons.append(f"OI Δ4h ↓ {oi_delta_4h:.1f}% ✅")
+                    
+                    # Divergência
+                    elif oi_delta_4h < -8 and direcao_sinal > 0:
+                        oi_score = -1.0
+                        reasons.append(f"OI Δ4h ↓ {oi_delta_4h:.1f}% ⚠️ (divergência)")
+                    elif oi_delta_4h > 8 and direcao_sinal < 0:
+                        oi_score = -1.0
+                        reasons.append(f"OI Δ4h ↑ +{oi_delta_4h:.1f}% ⚠️ (divergência)")
+                    
+                    # Bónus 1h
+                    if abs(oi_delta_1h) > 3 and oi_score > 0:
+                        oi_score += 0.3
+                        reasons.append(f"OI Δ1h {oi_delta_1h:+.1f}%")
+            
+            score_breakdown['OI_Delta'] = round(oi_score, 1)
+            score += oi_score
+            # ============================================================
+            
             # Arredonda score para 1 decimal
             score = round(score, 1)
 
@@ -929,7 +1005,7 @@ def analyze():
             categorias = {
                 'tendencia': ema_score + macd_score,                 # EMA + MACD
                 'momento':   rsi_score,                              # RSI
-                'volume':    vol_score,                              # Volume
+                'volume':    vol_score + oi_score,                   # Volume + OI Delta
                 'contexto':  funding_score + pattern_score,          # Funding + Padroes
             }
             cats_concordam = sum(1 for v in categorias.values() if v != 0 and (1 if v > 0 else -1) == direcao)
@@ -1827,7 +1903,7 @@ if not DRY_RUN:
     reconciliar_posicoes()
 
 sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n📈 <b>NOVO v5.22:</b> Open Interest Delta (confirmação + divergência)\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
 
 _dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
 while True:
