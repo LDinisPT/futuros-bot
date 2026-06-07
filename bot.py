@@ -15,7 +15,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.21"
+VERSAO = "v5.22"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -284,6 +284,59 @@ def bg_close_position(symbol):
     return bg_request("POST", "/api/v2/mix/order/close-positions", {
         "symbol": symbol, "productType": "USDT-FUTURES"
     })
+
+# ===== OPEN INTEREST (v5.21) — informativo no /teste =====
+oi_snapshots = {}  # {bgsym: (size, timestamp)} - guarda ultimo OI visto por par
+
+def bg_get_oi(bgsym):
+    """Busca o Open Interest atual do par. Retorna (size_float, ts_ms) ou (None,None)."""
+    try:
+        resp = requests.get(f"{BG_API}/api/v2/mix/market/open-interest",
+            params={"symbol":bgsym, "productType":"USDT-FUTURES"}, timeout=10).json()
+        if resp.get("code") == "00000":
+            d = resp.get("data", {})
+            lista = d.get("openInterestList", [])
+            if lista:
+                size = float(lista[0].get("size", 0))
+                ts = int(d.get("ts", 0))
+                return size, ts
+    except Exception as e:
+        print(f"Erro bg_get_oi {bgsym}: {e}")
+    return None, None
+
+def oi_contexto(bgsym, price_sobe=None):
+    """Devolve uma linha informativa sobre o OI atual vs o ultimo snapshot.
+    Guarda o novo snapshot para a proxima chamada. price_sobe: True/False/None
+    para interpretar a combinacao OI+preco."""
+    size, ts = bg_get_oi(bgsym)
+    if size is None:
+        return ""
+    anterior = oi_snapshots.get(bgsym)
+    oi_snapshots[bgsym] = (size, ts)  # atualiza snapshot
+
+    if not anterior:
+        # primeira leitura: nao ha com que comparar
+        return f"📊 OI atual: {size:,.0f} (1ª leitura, sem comparação)"
+
+    size_ant, ts_ant = anterior
+    if size_ant <= 0:
+        return f"📊 OI atual: {size:,.0f}"
+    delta_pct = (size - size_ant) / size_ant * 100
+    mins = max(1, int((ts - ts_ant) / 60000)) if ts > ts_ant else 0
+    tempo = f"{mins}min" if mins < 60 else f"{mins//60}h{mins%60:02d}"
+
+    # seta e interpretacao
+    if delta_pct > 1.0:
+        seta = "⬆️"
+        interp = "entrada de dinheiro (tendência a ganhar força)"
+    elif delta_pct < -1.0:
+        seta = "⬇️"
+        interp = "saída de posições (tendência a perder força)"
+    else:
+        seta = "➡️"
+        interp = "estável"
+    linha = f"📊 OI: {seta} {delta_pct:+.1f}% ({tempo}) — {interp}"
+    return linha
 
 def bg_set_position_tpsl(symbol, hold_side, sl_price, tp_price):
     """Coloca SL+TP numa posicao JA aberta (place-pos-tpsl).
@@ -1106,8 +1159,14 @@ def forcar_teste(symbol):
         
         # Novo formato: (sym, price, 0, rsi, label, score, score_breakdown, reasons, atr_val)
         sig = (sym, price, 0, r, label, score, score_breakdown, reasons, atr_val)
-        
-        send(f"🧪 <b>TESTE: {sym}</b>\n━━━━━━━━━━━━━━━\n💲 ${price:,.2f}\n📊 RSI: {r:.1f}\n⚡ {label}")
+
+        # Open Interest informativo (v5.21) - nao afeta o score
+        oi_linha = oi_contexto(bgsym, price_sobe=bull)
+
+        msg_teste = f"🧪 <b>TESTE: {sym}</b>\n━━━━━━━━━━━━━━━\n💲 ${price:,.2f}\n📊 RSI: {r:.1f}\n⚡ {label}"
+        if oi_linha:
+            msg_teste += f"\n{oi_linha}"
+        send(msg_teste)
         enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL")
         
     except Exception as e:
