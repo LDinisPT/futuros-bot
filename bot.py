@@ -48,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.23"
+VERSAO = "v5.24"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -148,6 +148,27 @@ def send_photo(buf, caption):
     except Exception as e:
         print(f"Erro foto: {e}")
         send(caption)
+
+def edit_message(message_id, msg, buttons=None):
+    """Edita uma mensagem existente (para menus inline que se transformam)."""
+    try:
+        payload = {"chat_id": CHAT_ID, "message_id": message_id,
+                   "text": msg, "parse_mode": "HTML"}
+        if buttons is not None:
+            payload["reply_markup"] = {"inline_keyboard": buttons}
+        requests.post(f"{API}/editMessageText", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erro edit: {e}")
+
+def answer_callback(callback_id, text=None):
+    """Responde ao toque num botão (tira o 'relógio' a girar no Telegram)."""
+    try:
+        payload = {"callback_query_id": callback_id}
+        if text:
+            payload["text"] = text
+        requests.post(f"{API}/answerCallbackQuery", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erro answer_callback: {e}")
 
 def get_updates():
     global last_update_id
@@ -1822,6 +1843,167 @@ def fechar_posicao_callback(symbol):
     else: 
         send(f"❌ Erro: {close_r.get('msg','?')}")
 
+# ==================== MENU INLINE (v5.24) ====================
+# Estado da navegacao de entrada manual guiada {chat: {par, direcao, ...}}
+menu_entrada = {}
+
+def menu_principal_botoes():
+    """Grelha 2 colunas do menu principal, estilo SolTradingBot."""
+    return [
+        [{"text":"💰 Saldo","callback_data":"m_saldo"},
+         {"text":"📈 Posições","callback_data":"m_posicoes"}],
+        [{"text":"⚡ Entrar","callback_data":"m_entrar"},
+         {"text":"🧪 Testar Par","callback_data":"m_testar"}],
+        [{"text":"📊 Ganhos Hoje","callback_data":"m_ganhos"},
+         {"text":"📉 Stats","callback_data":"m_stats"}],
+        [{"text":"❌ Fechar Posição","callback_data":"m_fechar"},
+         {"text":"❓ Ajuda","callback_data":"m_ajuda"}],
+    ]
+
+def mostrar_menu_principal(message_id=None):
+    """Mostra (ou edita para) o menu principal."""
+    titulo = (f"📊 <b>{TAG}PAINEL PRINCIPAL</b>\n"
+              f"━━━━━━━━━━━━━━━\n"
+              f"🤖 {BOT_NAME} {VERSAO}\n"
+              f"🎯 Pares: {', '.join(p[1] for p in PAIRS)}\n"
+              f"━━━━━━━━━━━━━━━\n"
+              f"Escolhe uma opção 👇")
+    if message_id:
+        edit_message(message_id, titulo, menu_principal_botoes())
+    else:
+        send_with_buttons(titulo, menu_principal_botoes())
+
+def menu_escolher_par(message_id):
+    """Submenu: escolher par para entrar."""
+    emojis = {"BTC":"🟠","XRP":"🔵","UNI":"🦄","ATOM":"⚛️","ETH":"💎","SOL":"🌅"}
+    linhas = []
+    fila = []
+    for _, nome, bgsym in PAIRS:
+        e = emojis.get(nome, "•")
+        fila.append({"text":f"{e} {nome}","callback_data":f"e_par_{bgsym}"})
+        if len(fila) == 2:
+            linhas.append(fila); fila = []
+    if fila:
+        linhas.append(fila)
+    linhas.append([{"text":"« Voltar","callback_data":"m_voltar"}])
+    edit_message(message_id, "⚡ <b>ENTRAR — escolhe o par:</b>", linhas)
+
+def menu_escolher_direcao(message_id, bgsym):
+    """Submenu: escolher direcao Long/Short."""
+    menu_entrada[CHAT_ID] = {"par": bgsym}
+    nome = bgsym.replace("USDT","")
+    linhas = [
+        [{"text":"🟢 LONG (subir)","callback_data":"e_dir_L"},
+         {"text":"🔴 SHORT (descer)","callback_data":"e_dir_S"}],
+        [{"text":"« Voltar","callback_data":"m_entrar"}],
+    ]
+    edit_message(message_id, f"⚡ <b>{nome}</b> — escolhe a direção:", linhas)
+
+def menu_escolher_valor(message_id, direcao):
+    """Submenu: escolher valor da margem."""
+    est = menu_entrada.get(CHAT_ID, {})
+    est["direcao"] = direcao
+    menu_entrada[CHAT_ID] = est
+    nome = est.get("par","?").replace("USDT","")
+    dir_txt = "🟢 LONG" if direcao == "L" else "🔴 SHORT"
+    linhas = [
+        [{"text":"$20","callback_data":"e_val_20"},
+         {"text":"$50","callback_data":"e_val_50"}],
+        [{"text":"$100","callback_data":"e_val_100"},
+         {"text":"$200","callback_data":"e_val_200"}],
+        [{"text":"« Voltar","callback_data":f"e_par_{est.get('par','')}"}],
+    ]
+    edit_message(message_id, f"⚡ <b>{nome} {dir_txt}</b>\nEscolhe a margem (USDT):", linhas)
+
+def menu_confirmar_entrada(message_id, valor):
+    """Confirmacao final antes de executar."""
+    est = menu_entrada.get(CHAT_ID, {})
+    est["valor"] = valor
+    menu_entrada[CHAT_ID] = est
+    nome = est.get("par","?").replace("USDT","")
+    dir_txt = "🟢 LONG" if est.get("direcao")=="L" else "🔴 SHORT"
+    linhas = [
+        [{"text":"✅ Confirmar","callback_data":"e_confirmar"},
+         {"text":"❌ Cancelar","callback_data":"m_voltar"}],
+    ]
+    txt = (f"⚡ <b>CONFIRMAR ENTRADA</b>\n━━━━━━━━━━━━━━━\n"
+           f"Par: <b>{nome}</b>\nDireção: {dir_txt}\n"
+           f"Margem: <b>${valor}</b> | Alav.: {MAX_LEV}x\n"
+           f"━━━━━━━━━━━━━━━\nConfirmas?")
+    edit_message(message_id, txt, linhas)
+
+def menu_lista_pares_testar(message_id):
+    """Submenu: escolher par para /teste."""
+    emojis = {"BTC":"🟠","XRP":"🔵","UNI":"🦄","ATOM":"⚛️"}
+    linhas = []; fila = []
+    for _, nome, bgsym in PAIRS:
+        fila.append({"text":f"{emojis.get(nome,'•')} {nome}","callback_data":f"t_par_{nome}"})
+        if len(fila)==2: linhas.append(fila); fila=[]
+    if fila: linhas.append(fila)
+    linhas.append([{"text":"« Voltar","callback_data":"m_voltar"}])
+    edit_message(message_id, "🧪 <b>TESTAR — escolhe o par:</b>", linhas)
+
+def tratar_callback_menu(callback_data, message_id, callback_id):
+    """Roteia os toques nos botões do menu. Devolve True se tratou."""
+    # Navegacao principal
+    if callback_data == "m_voltar":
+        answer_callback(callback_id); mostrar_menu_principal(message_id); return True
+    if callback_data == "m_saldo":
+        answer_callback(callback_id, "A buscar saldo..."); mostrar_saldo(); return True
+    if callback_data == "m_posicoes":
+        answer_callback(callback_id, "A buscar posições..."); mostrar_posicoes(); return True
+    if callback_data == "m_ganhos":
+        answer_callback(callback_id); mostrar_ganhos(1); return True
+    if callback_data == "m_stats":
+        answer_callback(callback_id); send(calc_stats_geral()); return True
+    if callback_data == "m_fechar":
+        answer_callback(callback_id); menu_fechar(); return True
+    if callback_data == "m_ajuda":
+        answer_callback(callback_id); mostrar_ajuda(); return True
+    # Fluxo de entrada guiada
+    if callback_data == "m_entrar":
+        answer_callback(callback_id); menu_escolher_par(message_id); return True
+    if callback_data.startswith("e_par_"):
+        answer_callback(callback_id)
+        menu_escolher_direcao(message_id, callback_data.replace("e_par_","")); return True
+    if callback_data.startswith("e_dir_"):
+        answer_callback(callback_id)
+        menu_escolher_valor(message_id, callback_data.replace("e_dir_","")); return True
+    if callback_data.startswith("e_val_"):
+        answer_callback(callback_id)
+        menu_confirmar_entrada(message_id, int(callback_data.replace("e_val_",""))); return True
+    if callback_data == "e_confirmar":
+        answer_callback(callback_id, "A processar...")
+        est = menu_entrada.get(CHAT_ID, {})
+        executar_entrada_menu(est, message_id); return True
+    # Testar par
+    if callback_data == "m_testar":
+        answer_callback(callback_id); menu_lista_pares_testar(message_id); return True
+    if callback_data.startswith("t_par_"):
+        answer_callback(callback_id)
+        forcar_teste(callback_data.replace("t_par_","")); return True
+    return False
+
+def executar_entrada_menu(est, message_id):
+    """Executa a entrada manual escolhida pelo menu guiado."""
+    par = est.get("par"); direcao = est.get("direcao"); valor = est.get("valor")
+    if not (par and direcao and valor):
+        edit_message(message_id, "⚠️ Faltam dados. Recomeça com ⚡ Entrar.",
+                     [[{"text":"« Menu","callback_data":"m_voltar"}]])
+        return
+    # circuit breaker
+    if circuit_breaker_ativo():
+        edit_message(message_id, f"🚨 Entrada bloqueada — circuit breaker (perda ≥ ${DAILY_LOSS_LIMIT:.0f}).",
+                     [[{"text":"« Menu","callback_data":"m_voltar"}]])
+        return
+    nome = par.replace("USDT","")
+    dir_txt = "🟢 LONG" if direcao=="L" else "🔴 SHORT"
+    edit_message(message_id, f"⏳ A abrir {nome} {dir_txt} ${valor}...")
+    log_msg(f"ENTRADA MENU | {par} | {('LONG' if direcao=='L' else 'SHORT')} | ${valor}")
+    # reutiliza o mt_exec existente: /mt <par> <L/S> <valor> <lev>
+    mt_exec(["/mt", nome.lower(), direcao.lower(), str(valor), str(MAX_LEV)])
+    menu_entrada.pop(CHAT_ID, None)
+
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -1831,8 +2013,15 @@ def process_replies():
         if "callback_query" in u:
             callback = u["callback_query"]
             callback_data = callback.get("data", "")
-            
+            callback_id = callback.get("id", "")
+            message_id = callback.get("message", {}).get("message_id")
+
+            # Menus inline (v5.24)
+            if tratar_callback_menu(callback_data, message_id, callback_id):
+                continue
+
             if callback_data.startswith("fechar_"):
+                answer_callback(callback_id)
                 symbol = callback_data.replace("fechar_", "")
                 fechar_posicao_callback(symbol)
             continue
@@ -1872,7 +2061,9 @@ def process_replies():
             continue
         if text.startswith("/fechar"):
             menu_fechar(); continue
-        if text.startswith("/ajuda") or text.startswith("/start"): mostrar_ajuda(); continue
+        if text.startswith("/menu"): mostrar_menu_principal(); continue
+        if text.startswith("/ajuda"): mostrar_ajuda(); continue
+        if text.startswith("/start"): mostrar_menu_principal(); continue
         if text.startswith("/"): continue
         if CHAT_ID not in pending: continue
         if text in ("não","nao","n","no"):
