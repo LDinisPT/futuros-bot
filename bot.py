@@ -1,7 +1,40 @@
-import os, time, requests, io, hmac, hashlib, base64, json
+import os, time, requests, io, hmac, hashlib, base64, json, socket
+from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+
+# ===== LOGGING (v5.22) — identifica o bot (Pi vs Railway) e regista tudo =====
+def setup_logging():
+    """Setup logging para ficheiro, identifica se é Pi ou Railway."""
+    hostname = socket.gethostname()
+    is_pi = "Dinis-PI" in hostname or "raspberrypi" in hostname.lower()
+    bot_id = "Pi" if is_pi else "Railway"
+    
+    # cria pasta de logs se nao existir
+    log_dir = os.path.expanduser("~/logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # ficheiro de log diario
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_file = os.path.join(log_dir, f"bot_{bot_id}_{today}.log")
+    
+    return log_file, bot_id
+
+LOG_FILE, BOT_ID = setup_logging()
+
+# Etiqueta visível nas mensagens — so aparece no Railway (no Pi fica vazia)
+TAG = "[Railway] " if BOT_ID == "Railway" else ""
+
+def log_msg(msg):
+    """Escreve mensagem ao log com timestamp."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    linha = f"[{ts}] {msg}\n"
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(linha)
+    except Exception as e:
+        print(f"Erro ao escrever log: {e}")
 
 # ==================== CONFIG ====================
 TOKEN = os.environ["BOT_TOKEN"]
@@ -15,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.22"
+VERSAO = "v5.23"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -1030,6 +1063,10 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
     sl,tp1,tp2,_ = calc_levels(price,label,atr_val)
     dist_pct = abs(sl-price)/price*100
     
+    # Log o sinal
+    direcao = "LONG" if score > 0 else "SHORT"
+    log_msg(f"SINAL {tipo:6s} | {sym:6s} | {direcao:5s} | score {score:+.1f} | price ${price:,.2f}")
+    
     # Calcular confiança baseado no score
     confianca = min(95, 50 + (abs(score) * 10))
     
@@ -1062,7 +1099,7 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
             entrada_valor, entrada_tipo = 50, "margem"
             desc_entrada = "$50 margem"
 
-        cap  = f"⚡ <b>ENTRADA AUTOMÁTICA!</b>\n{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
+        cap  = f"⚡ <b>{TAG}ENTRADA AUTOMÁTICA!</b>\n{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
         cap += f"💲 Entrada: ${fmt(price)}\n🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n🎯 TP1: ${fmt(tp1)}\n"
         cap += f"━━━━━━━━━━━━━━━\n"
         cap += f"📉 RSI: {rsi_v} | <b>Score: {score:+.1f}</b> (Confiança: {confianca:.0f}%)\n"
@@ -1073,11 +1110,13 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
         buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
         if buf: send_photo(buf, cap)
         else: send(cap)
+        # Log entrada automatica
+        log_msg(f"ENTRADA AUTO | {sym:6s} | {('LONG' if 'LONG' in label else 'SHORT'):5s} | ${fmt(price):>10s} | SL ${fmt(sl):>10s}")
         # Executa automático com sizing por risco
         executar_trade(sig, bgsym, entrada_valor, "hibrido", entrada_tipo)
     else:
         # ENTRADA MANUAL (score 4-5 ou -4 a -5) COM BOTÕES
-        cap  = f"{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
+        cap  = f"{TAG}{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
         cap += f"💲 Entrada: ${fmt(price)} | 📊 RSI: {rsi_v}\n"
         cap += f"🛑 SL: ${fmt(sl)} ({dist_pct:.2f}%)\n"
         cap += f"🎯 TP1: ${fmt(tp1)}\n"
@@ -1886,7 +1925,9 @@ if not DRY_RUN:
     reconciliar_posicoes()
 
 sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
-send(f"🤖 <b>{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda")
+msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda"
+send(msg_arranque)
+log_msg(f"BOT ARRANQUE — {BOT_ID} — {VERSAO} — {len(PAIRS)} pares ({', '.join(p[1] for p in PAIRS)})")
 
 _dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
 while True:
