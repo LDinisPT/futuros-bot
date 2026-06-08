@@ -48,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.24"
+VERSAO = "v5.25"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -169,6 +169,25 @@ def answer_callback(callback_id, text=None):
         requests.post(f"{API}/answerCallbackQuery", json=payload, timeout=10)
     except Exception as e:
         print(f"Erro answer_callback: {e}")
+
+def send_com_teclado_fixo(msg):
+    """Envia mensagem com teclado fixo em baixo (reply keyboard) — nunca desaparece.
+    Os botões enviam texto como se o utilizador o tivesse escrito."""
+    try:
+        payload = {
+            "chat_id": CHAT_ID, "text": msg, "parse_mode": "HTML",
+            "reply_markup": {
+                "keyboard": [
+                    [{"text":"📊 Menu"}, {"text":"📈 Posições"}],
+                    [{"text":"💰 Saldo"}, {"text":"⚡ Entrar"}],
+                ],
+                "resize_keyboard": True,      # botões mais pequenos/ajustados
+                "is_persistent": True,        # mantém-se sempre visível
+            }
+        }
+        requests.post(f"{API}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erro teclado fixo: {e}")
 
 def get_updates():
     global last_update_id
@@ -2028,6 +2047,11 @@ def process_replies():
         
         text = u.get("message",{}).get("text","").strip().lower()
         if not text: continue
+        # Botões do teclado fixo (enviam texto)
+        if text == "📊 menu": mostrar_menu_principal(); continue
+        if text == "📈 posições" or text == "📈 posicoes": mostrar_posicoes(); continue
+        if text == "💰 saldo": mostrar_saldo(); continue
+        if text == "⚡ entrar": mostrar_menu_principal(); continue
         if text.startswith("/teste"):
             p=text.split(); forcar_teste(p[1] if len(p)>1 else "BTC"); continue
         if text.startswith("/limpar"): limpar_ordens(); continue
@@ -2116,8 +2140,9 @@ if not DRY_RUN:
     reconciliar_posicoes()
 
 sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
-msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ BOTÕES: Clica em vez de digitar\nEscreve /ajuda"
-send(msg_arranque)
+msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ Usa os botões 👇"
+send_com_teclado_fixo(msg_arranque)   # instala o teclado fixo (nunca desaparece)
+mostrar_menu_principal()              # abre logo o painel inline no arranque
 log_msg(f"BOT ARRANQUE — {BOT_ID} — {VERSAO} — {len(PAIRS)} pares ({', '.join(p[1] for p in PAIRS)})")
 
 _dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
