@@ -48,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.25"
+VERSAO = "v5.26"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -2023,6 +2023,81 @@ def executar_entrada_menu(est, message_id):
     mt_exec(["/mt", nome.lower(), direcao.lower(), str(valor), str(MAX_LEV)])
     menu_entrada.pop(CHAT_ID, None)
 
+# ==================== ESPREITADELA 5min (v5.26) ====================
+# Olha de 5 em 5 min sem entrar — so avisa se score >= LIMITE_AVISO.
+# Reutiliza calc_score_simples (mesmas funcoes de indicadores do analyze).
+PEEK_INTERVAL = 300        # 5 minutos
+LIMITE_AVISO = 6.0         # avisa a partir deste |score|
+last_peek = 0
+peek_avisado = {}          # {bgsym: ultimo_score_avisado} — evita spam
+
+def calc_score_peek(bgsym):
+    """Calcula o score de um par de forma leve, para a espreitadela.
+    Replica a mesma logica do analyze() mas so devolve (score, cats, price)."""
+    candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
+    if not candles:
+        return None
+    closes = [float(c[4]) for c in candles]
+    highs  = [float(c[2]) for c in candles]
+    lows   = [float(c[3]) for c in candles]
+    volumes= [float(c[5]) if len(c) > 5 else 1.0 for c in candles]
+    price, _ = bg_get_ticker(bgsym)
+    if not price:
+        return None
+    r = rsi(closes)
+    e20 = ema_arr(closes, 20); e50 = ema_arr(closes, 50)
+    bull = e20[-1] > e50[-1]
+    ml, sl_, hist = macd(closes)
+    vol_recente = sum(volumes[-5:])/5 if len(volumes)>=5 else 1
+    vol_medio = sum(volumes[-25:-5])/20 if len(volumes)>=25 else vol_recente
+    vol_ratio = vol_recente/vol_medio if vol_medio else 1
+
+    score = 0.0
+    rsi_s = 3.0 if r<30 else 1.5 if r<40 else -3.0 if r>70 else -1.5 if r>60 else 0.0
+    score += rsi_s
+    ema_s = 2.0 if bull else -2.0
+    score += ema_s
+    macd_s = 2.0 if (ml>sl_ and hist>0) else -2.0 if (ml<sl_ and hist<0) else 0.0
+    score += macd_s
+    vol_s = 1.0 if (vol_ratio>1.3 and score>0) else -0.5 if vol_ratio<0.6 else 0.0
+    score += vol_s
+    score = round(score, 1)
+    # confluencia (3 categorias na versao leve: tendencia, momento, volume)
+    direcao = 1 if score>0 else -1
+    cats = 0
+    if (ema_s+macd_s)*direcao > 0: cats += 1
+    if rsi_s*direcao > 0: cats += 1
+    if vol_s*direcao > 0: cats += 1
+    return score, cats, price
+
+def espreitar():
+    """Espreitadela de 5min: avisa sinais a aproximarem-se, NAO entra."""
+    global last_peek
+    last_peek = time.time()
+    for _, sym, bgsym in PAIRS:
+        try:
+            res = calc_score_peek(bgsym)
+            if not res:
+                continue
+            score, cats, price = res
+            log_msg(f"PEEK | {bgsym:6s} | score {score:+.1f} | cats {cats}/3 | ${price:,.4f}")
+            # avisa so se cruzar o limite E mudou desde o ultimo aviso (evita spam)
+            if abs(score) >= LIMITE_AVISO:
+                ja = peek_avisado.get(bgsym)
+                if ja != score:
+                    peek_avisado[bgsym] = score
+                    direcao = "🟢 LONG" if score>0 else "🔴 SHORT"
+                    falta = max(0, int((ANALYSIS_INTERVAL-(time.time()-last_analysis))/60))
+                    send(f"👀 <b>{sym} a aproximar-se de sinal!</b>\n"
+                         f"{direcao} | score {score:+.1f} | ${fmt(price)}\n"
+                         f"⏱️ Análise oficial em ~{falta}min\n"
+                         f"<i>(aviso — o bot ainda não entrou)</i>")
+            else:
+                # saiu da zona de aviso -> limpa para poder voltar a avisar
+                peek_avisado.pop(bgsym, None)
+        except Exception as e:
+            print(f"Erro espreitar {bgsym}: {e}")
+
 def process_replies():
     global last_update_id
     for u in get_updates():
@@ -2146,6 +2221,7 @@ mostrar_menu_principal()              # abre logo o painel inline no arranque
 log_msg(f"BOT ARRANQUE — {BOT_ID} — {VERSAO} — {len(PAIRS)} pares ({', '.join(p[1] for p in PAIRS)})")
 
 _dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
+last_peek = time.time()   # primeira espreitadela só daqui a 5 min (evita duplicar com a 1ª análise)
 while True:
     # Reset diario do circuit breaker (UTC)
     _hoje = time.strftime("%Y-%m-%d", time.gmtime())
@@ -2156,6 +2232,14 @@ while True:
 
     process_replies()
     verificar_posicoes_fechadas()
+
+    # Espreitadela de 5min (v5.26) — só avisa, não entra
+    if time.time()-last_peek >= PEEK_INTERVAL:
+        try:
+            espreitar()
+        except Exception as e:
+            print(f"Erro espreitadela: {e}")
+
     if time.time()-last_analysis >= ANALYSIS_INTERVAL:
         print(f"A analisar mercado ({ANALYSIS_INTERVAL}s)...")
         try:
