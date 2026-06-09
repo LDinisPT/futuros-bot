@@ -48,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.26"
+VERSAO = "v5.27"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -1253,6 +1253,49 @@ def forcar_teste(symbol):
         print(f"Teste error {sym}: {e}")
 
 
+# ===== PRECISAO DE CONTRATOS (v5.27) — corrige erro "multiple of 0.1" =====
+_contract_specs = {}  # cache {bgsym: {pricePlace, priceEndStep, volumePlace, minTradeNum}}
+
+def get_contract_specs(bgsym):
+    """Busca (e cacheia) a precisao de preco/quantidade do par na Bitget."""
+    if bgsym in _contract_specs:
+        return _contract_specs[bgsym]
+    try:
+        resp = requests.get(f"{BG_API}/api/v2/mix/market/contracts",
+            params={"symbol":bgsym, "productType":"USDT-FUTURES"}, timeout=10).json()
+        if resp.get("code") == "00000" and resp.get("data"):
+            d = resp["data"][0]
+            specs = {
+                "pricePlace":   int(d.get("pricePlace", 2)),
+                "priceEndStep": int(d.get("priceEndStep", 1)),
+                "volumePlace":  int(d.get("volumePlace", 3)),
+                "minTradeNum":  float(d.get("minTradeNum", 0.001)),
+            }
+            _contract_specs[bgsym] = specs
+            return specs
+    except Exception as e:
+        print(f"Erro specs {bgsym}: {e}")
+    # fallback seguro
+    return {"pricePlace":2, "priceEndStep":1, "volumePlace":3, "minTradeNum":0.001}
+
+def ajustar_preco(bgsym, preco):
+    """Arredonda o preco para o tick correto do par (pricePlace + priceEndStep).
+    Ex BTC: pricePlace=1, priceEndStep=1 -> multiplos de 0.1."""
+    s = get_contract_specs(bgsym)
+    tick = s["priceEndStep"] / (10 ** s["pricePlace"])   # ex: 1/10^1 = 0.1
+    if tick <= 0:
+        tick = 10 ** (-s["pricePlace"])
+    preco_aj = round(preco / tick) * tick
+    return round(preco_aj, s["pricePlace"])
+
+def ajustar_qtd(bgsym, qtd):
+    """Arredonda a quantidade para volumePlace casas e respeita minTradeNum."""
+    s = get_contract_specs(bgsym)
+    q = round(qtd, s["volumePlace"])
+    if q < s["minTradeNum"]:
+        q = s["minTradeNum"]
+    return q
+
 def mt_exec(args):
     """
     /mt BTC L 50 10
@@ -1324,19 +1367,20 @@ def mt_exec(args):
             sl = price + sl_dist
             tp = price - tp_dist
         
-        # Arredonda preços para precisão Bitget
-        sl = round(sl, 2)
-        tp = round(tp, 2)
+        # Arredonda preços para a precisão CORRETA de cada par (v5.27)
+        sl = ajustar_preco(par, sl)
+        tp = ajustar_preco(par, tp)
         
-        # Tamanho
-        size = notional / price
+        # Tamanho (ajustado à precisão de quantidade do par)
+        size = ajustar_qtd(par, notional / price)
         
         # Set leverage
         bg_set_leverage(par, alav)
         time.sleep(1)
         
-        # ABRE ORDEM (50% TP)
-        result = bg_place_order(par, is_long, size/2, sl, tp)
+        # ABRE ORDEM (50% TP) — metades ajustadas à precisão do par
+        meia = ajustar_qtd(par, size / 2)
+        result = bg_place_order(par, is_long, meia, sl, tp)
         
         if result.get("code") != "00000":
             send(f"❌ Erro ao abrir: {result.get('msg','?')}"); return
@@ -1344,7 +1388,7 @@ def mt_exec(args):
         time.sleep(0.5)
         
         # Coloca trailing (50%)
-        bg_place_trailing(par, is_long, size/2, tp, CALLBACK_RATIO)
+        bg_place_trailing(par, is_long, meia, tp, CALLBACK_RATIO)
         
         # Sucesso!
         risco = abs(sl - price) * size
