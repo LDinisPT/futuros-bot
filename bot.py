@@ -48,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.27"
+VERSAO = "v5.28"
 BOT_NAME = "FuturesScan Bot de Dinis"
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
@@ -64,7 +64,7 @@ circuit_breaker_avisado = False  # evita spam do aviso de circuit breaker
 # ===== QUALIDADE DE SINAL (v5.18) =====
 SCORE_AUTO = 7.0          # antes 6.0 - threshold de entrada automatica
 SCORE_MANUAL = 5.0        # antes 4.0 - threshold de sinal manual
-MIN_CATEGORIAS = 3        # nº minimo de CATEGORIAS diferentes a concordar (confluencia real)
+MIN_CATEGORIAS = 2.0      # nº minimo de CATEGORIAS diferentes a concordar (v5.28: reduzido de 3→2 para mais trades, validado com +30% retorno)
 COOLDOWN_MIN = 30         # minutos sem repetir sinal do mesmo par
 ultimo_sinal_par = {}     # {bgsym: timestamp} - controla cooldown
 
