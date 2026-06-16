@@ -48,8 +48,24 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v5.28"
+VERSAO = "v6.0"
 BOT_NAME = "FuturesScan Bot de Dinis"
+
+# ===== PAPEL DA INSTANCIA (v6.0) =====
+# Duas instancias (Pi + Railway) partilham a MESMA conta Bitget. Se ambas
+# executassem, podiam abrir/fechar/cancelar em simultaneo (corrida + mensagens
+# duplicadas). Por isso so UMA deve ser "principal" (executa e gere posicoes);
+# a outra deve ser "alerta" (analisa e avisa, mas NAO mexe na conta).
+#   ROLE=principal  -> executa trades, gere posicoes, manda fechos/reconciliacao
+#   ROLE=alerta     -> so analisa e avisa (read-only na conta)
+# Define ROLE=alerta no ambiente de UMA das instancias (ver instrucoes no fim).
+ROLE = os.environ.get("ROLE", "principal").strip().lower()
+PRINCIPAL = ROLE != "alerta"
+
+# ===== HTTP / RETRY (v6.0) =====
+HTTP_RETRIES = 3          # tentativas em chamadas Bitget antes de desistir
+HTTP_BACKOFF = 0.8        # segundos base entre tentativas (cresce: 0.8, 1.6, 2.4)
+_time_offset = 0          # offset (ms) entre relogio local e servidor Bitget
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 SL_MIN_PCT = 0.6  # SL minimo: 0.6% da entrada (evita stops colados em mercado calmo)
@@ -75,36 +91,64 @@ last_position_check = 0
 posicoes_abertas_cache = {}
 trades_history = []  # Histórico de todos os trades fechados
 
+# ==================== HTTP HELPER (v6.0) ====================
+def http_get_json(url, params=None, timeout=15, retries=HTTP_RETRIES):
+    """GET publico com retry + backoff. Devolve dict json ou None.
+    Usado por todas as chamadas de mercado (candles, ticker, contracts)."""
+    for tentativa in range(retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:  # rate limit -> espera mais
+                time.sleep(HTTP_BACKOFF * (tentativa + 2))
+                continue
+            return r.json()
+        except Exception as e:
+            if tentativa == retries - 1:
+                print(f"Erro http_get_json ({url}): {e}")
+                return None
+            time.sleep(HTTP_BACKOFF * (tentativa + 1))
+    return None
+
+def bg_sync_time():
+    """Sincroniza o offset de relogio com o servidor Bitget (evita rejeicao
+    por timestamp se o relogio do Pi/Railway derivar)."""
+    global _time_offset
+    data = http_get_json(f"{BG_API}/api/v2/public/time", retries=2)
+    try:
+        if data and data.get("code") == "00000":
+            server_ms = int(data["data"]["serverTime"])
+            _time_offset = server_ms - int(time.time() * 1000)
+            print(f"⏱️ Offset de relogio com Bitget: {_time_offset} ms")
+    except Exception as e:
+        print(f"Erro bg_sync_time: {e}")
+
+def now_ms():
+    """Timestamp em ms ja corrigido com o offset do servidor."""
+    return str(int(time.time() * 1000) + _time_offset)
+
 # ==================== BITGET MARKET DATA ====================
 def bg_get_ohlcv(bgsym, granularity="60", limit=200):
     """Busca velas OHLCV da Bitget Futures"""
-    try:
-        resp = requests.get(
-            f"{BG_API}/api/v2/mix/market/candles",
-            params={"symbol": bgsym, "productType": "USDT-FUTURES", "granularity": granularity, "limit": str(limit)},
-            timeout=15
-        )
-        data = resp.json()
-        if data.get("code") != "00000":
-            print(f"Erro OHLCV {bgsym}: {data.get('msg')}")
-            return None
-        candles = data.get("data", [])
-        candles.reverse()  # Bitget: mais recente primeiro, invertemos
-        return candles
-    except Exception as e:
-        print(f"Erro bg_get_ohlcv {bgsym}: {e}")
+    data = http_get_json(
+        f"{BG_API}/api/v2/mix/market/candles",
+        params={"symbol": bgsym, "productType": "USDT-FUTURES", "granularity": granularity, "limit": str(limit)},
+    )
+    if not data or data.get("code") != "00000":
+        print(f"Erro OHLCV {bgsym}: {data.get('msg') if data else 'sem resposta'}")
         return None
+    candles = data.get("data", [])
+    candles.reverse()  # Bitget: mais recente primeiro, invertemos
+    return candles
 
 def bg_get_ticker(bgsym):
     """Busca preço actual da Bitget. Retorna (price, open_24h)"""
     try:
-        resp = requests.get(
+        data = http_get_json(
             f"{BG_API}/api/v2/mix/market/ticker",
             params={"symbol": bgsym, "productType": "USDT-FUTURES"},
-            timeout=10
+            timeout=10,
         )
-        data = resp.json()
-        if data.get("code") != "00000":
+        if not data or data.get("code") != "00000":
             return None, None
         t = data["data"][0]
         price  = float(t.get("lastPr") or t.get("last") or 0)
@@ -212,28 +256,44 @@ def bg_sign(ts, method, path, body=""):
     return base64.b64encode(mac.digest()).decode()
 
 def bg_request(method, path, params=None):
-    ts = str(int(time.time()*1000))
+    body = json.dumps(params) if (method != "GET" and params) else ""
     if method == "GET" and params:
-        query = "&".join(f"{k}={v}" for k,v in params.items())
-        path = path + "?" + query
-        body = ""
+        query = "&".join(f"{k}={v}" for k, v in params.items())
+        full_path = path + "?" + query
     else:
-        body = json.dumps(params) if params else ""
-    sign = bg_sign(ts, method, path, body)
-    headers = {
-        "ACCESS-KEY": BG_KEY, "ACCESS-SIGN": sign, "ACCESS-PASSPHRASE": BG_PASS,
-        "ACCESS-TIMESTAMP": ts, "locale": "en-US", "Content-Type": "application/json"
-    }
-    url = BG_API + path
-    try:
-        if method == "POST":
-            r = requests.post(url, headers=headers, data=body, timeout=15)
-        else:
-            r = requests.get(url, headers=headers, timeout=15)
-        return r.json()
-    except Exception as e:
-        print(f"Erro Bitget: {e}")
-        return {"code":"99999","msg":str(e)}
+        full_path = path
+    url = BG_API + full_path
+
+    ultimo = {"code": "99999", "msg": "sem resposta"}
+    for tentativa in range(HTTP_RETRIES):
+        ts = now_ms()
+        sign = bg_sign(ts, method, full_path, body)
+        headers = {
+            "ACCESS-KEY": BG_KEY, "ACCESS-SIGN": sign, "ACCESS-PASSPHRASE": BG_PASS,
+            "ACCESS-TIMESTAMP": ts, "locale": "en-US", "Content-Type": "application/json"
+        }
+        try:
+            if method == "POST":
+                r = requests.post(url, headers=headers, data=body, timeout=15)
+            else:
+                r = requests.get(url, headers=headers, timeout=15)
+            resp = r.json()
+        except Exception as e:
+            ultimo = {"code": "99999", "msg": str(e)}
+            time.sleep(HTTP_BACKOFF * (tentativa + 1))
+            continue
+
+        code = resp.get("code")
+        if code == "00000":
+            return resp
+        # erro de timestamp/assinatura -> ressincroniza relogio e tenta de novo
+        if code in ("40009", "40005", "40008") or "timestamp" in str(resp.get("msg", "")).lower():
+            bg_sync_time()
+            ultimo = resp
+            continue
+        # outros erros: nao vale a pena repetir (ex: saldo, parametros)
+        return resp
+    return ultimo
 
 # ==================== PARES + PRECISAO ====================
 # ===== PARES VALIDADOS (v5.21) =====
@@ -260,10 +320,10 @@ ORIGINAL_PAIRS = [
 ]
 
 def get_dynamic_pairs():
+    data = http_get_json(f"{BG_API}/api/v2/mix/market/contracts",
+                         params={"productType": "USDT-FUTURES"})
     try:
-        url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES"
-        data = requests.get(url, timeout=15).json()
-        if data.get("code") != "00000" or not data.get("data"):
+        if not data or data.get("code") != "00000" or not data.get("data"):
             raise Exception("resposta invalida")
         valid = {c.get("symbol") for c in data["data"]}
         pairs = [p for p in ORIGINAL_PAIRS if p[2] in valid]
@@ -275,38 +335,10 @@ def get_dynamic_pairs():
 
 PAIRS = get_dynamic_pairs()
 
-contract_precision = {}
-def get_precision(bgsym):
-    if bgsym in contract_precision:
-        return contract_precision[bgsym]
-    try:
-        url = f"{BG_API}/api/v2/mix/market/contracts?productType=USDT-FUTURES&symbol={bgsym}"
-        data = requests.get(url, timeout=10).json()
-        if data.get("code") == "00000" and data.get("data"):
-            vp = int(data["data"][0].get("volumePlace", 4))
-            pp = int(data["data"][0].get("pricePlace", 4))
-            contract_precision[bgsym] = (vp, pp)
-            return vp, pp
-    except:
-        pass
-    return 4, 4
-
-def calc_size(notional, price, bgsym):
-    vp, _ = get_precision(bgsym)
-    s = notional / price
-    m = 10 ** vp
-    size = round(s * m) / m
-    return max(size, 0.001)
-
-def round_size(size, bgsym):
-    vp, _ = get_precision(bgsym)
-    m = 10 ** vp
-    return max(round(size * m) / m, 0.001)
-
-def round_price(price, bgsym):
-    _, pp = get_precision(bgsym)
-    m = 10 ** pp
-    return round(price * m) / m
+# NOTA (v6.0): o antigo sistema de precisao (get_precision/round_price/round_size/
+# calc_size) foi REMOVIDO. Tudo passa agora por get_contract_specs + ajustar_preco/
+# ajustar_qtd (mais abaixo), que respeitam priceEndStep e minTradeNum. Isto corrige
+# o erro "multiple of 0.X" que so estava resolvido no /mt manual.
 
 # ==================== TRADING ====================
 def check_open_position(symbol):
@@ -656,29 +688,30 @@ def reconciliar_posicoes():
 
 
 def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
+    """Abre uma posicao. Devolve True se abriu com sucesso, False caso contrario."""
     sym, price, _, rsi_v, label, score, score_breakdown, reasons, atr_val = sig
     is_long = "LONG" in label
     sl, tp1, tp2, alav = calc_levels(price, label, atr_val)
-    sl = round_price(sl, bgsym); tp1 = round_price(tp1, bgsym)
+    sl = ajustar_preco(bgsym, sl); tp1 = ajustar_preco(bgsym, tp1)   # v6.0: precisao correta
     lev = min(alav, MAX_LEV)
 
     if tipo_valor == "risco":
         distancia = abs(sl - price)
         if distancia <= 0:
-            send("⚠️ Distância SL inválida."); return
+            send("⚠️ Distância SL inválida."); return False
         size_raw = valor / distancia
         notional = size_raw * price
         if notional > MAX_NOTIONAL:
-            send(f"⚠️ Posição muito grande (${notional:.0f})."); return
-        size = round_size(size_raw, bgsym)
+            send(f"⚠️ Posição muito grande (${notional:.0f})."); return False
+        size = ajustar_qtd(bgsym, size_raw)
         margem = notional / lev
         risco_real = valor
     else:
         margem = valor
         notional = margem * lev
         if notional > MAX_NOTIONAL:
-            send(f"⚠️ Posição muito grande (${notional:.0f})."); return
-        size = calc_size(notional, price, bgsym)
+            send(f"⚠️ Posição muito grande (${notional:.0f})."); return False
+        size = ajustar_qtd(bgsym, notional / price)
         distancia = abs(sl - price)
         risco_real = size * distancia
 
@@ -691,10 +724,18 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         m += f"⚡ {lev}x | 💰 Margem ${margem:.2f}\n📊 Size: {size}\n"
         m += f"🛑 SL: ${fmt(sl)} (risco ${risco_real:.2f})\n🎯 TP1: ${fmt(tp1)}\n"
         m += "<i>(DRY_RUN)</i>"
-        send(m); return
+        send(m); return False
+
+    # v6.0: instancia "alerta" nao mexe na conta — so avisa.
+    if not PRINCIPAL:
+        m  = f"📢 <b>SINAL (modo alerta — não executei)</b>\n━━━━━━━━━━━━━━━\n"
+        m += f"{arrow} {sym}/USDT — {direcao} | score {score:+.1f}\n"
+        m += f"💲 ~${fmt(price)} | 🛑 SL ${fmt(sl)} | 🎯 TP1 ${fmt(tp1)}\n"
+        m += f"<i>(esta instância está como ROLE=alerta)</i>"
+        send(m); return False
 
     if check_open_position(bgsym):
-        send(f"⚠️ Já tens posição em <b>{sym}</b>."); return
+        send(f"⚠️ Já tens posição em <b>{sym}</b>."); return False
 
     bg_set_leverage(bgsym, lev)
     time.sleep(1)
@@ -705,20 +746,18 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         r = bg_place_order(bgsym, is_long, size, sl)
 
     if r.get("code") != "00000":
-        send(f"❌ Erro ao abrir: {r.get('msg','?')}"); return
+        send(f"❌ Erro ao abrir: {r.get('msg','?')}"); return False
 
     extra = "TP1 fecha 100%"
-    avisos = []
     if modo == "trail":
         rt = bg_place_trailing(bgsym, is_long, size, tp1, CALLBACK_RATIO)
         if rt.get("code") == "00000":
             extra = f"Trailing {CALLBACK_RATIO}% (100%)"
         else:
-            avisos.append(f"⚠️ Trailing falhou")
-            extra = "SL fixo"
+            extra = "SL fixo (trailing falhou)"
     elif modo == "hibrido":
-        metade = round_size(size/2, bgsym)
-        resto = round_size(size - metade, bgsym)
+        metade = ajustar_qtd(bgsym, size/2)
+        resto = ajustar_qtd(bgsym, size - metade)
         rtp = bg_close_limit(bgsym, is_long, metade, tp1)
         rtr = bg_place_trailing(bgsym, is_long, resto, tp1, CALLBACK_RATIO)
         ok_tp = rtp.get("code") == "00000"
@@ -734,14 +773,17 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
     time.sleep(1)  # da tempo a Bitget refletir a nova posicao
     m += resumo_pos_saldo()
     send(m)
-    
+
     posicoes_abertas_cache[bgsym] = {
         "sym": sym,
         "lado": direcao,
         "entrada": price,
         "modo": modo,
+        "lev": lev,
+        "margem": margem,
         "tempo_abertura": time.time()
     }
+    return True
 
 # ==================== RASTREAMENTO DE POSIÇÕES ====================
 def verificar_posicoes_fechadas():
@@ -751,7 +793,12 @@ def verificar_posicoes_fechadas():
         return
     
     last_position_check = time.time()
-    
+
+    # v6.0: so a instancia principal gere posicoes e manda mensagens de fecho
+    # (evita fechos/cancelamentos e mensagens duplicadas com a instancia alerta).
+    if not PRINCIPAL:
+        return
+
     resp = bg_request("GET", "/api/v2/mix/position/all-position",
                       {"productType":"USDT-FUTURES","marginCoin":"USDT"})
     
@@ -772,22 +819,43 @@ def verificar_posicoes_fechadas():
                     if p.get("symbol") == bgsym:
                         pnl = float(p.get("netProfit") or p.get("pnl") or 0)
                         tempo_aberto = int((time.time() - info_antiga["tempo_abertura"])/60)
-                        
-                        # Calcula % de ganho
-                        entrada = info_antiga['entrada']
-                        preco_fecho = entrada + (pnl / 254)  # Aproximado
-                        pct_ganho = (pnl / (50 * 3)) * 100 if pnl != 0 else 0  # $50 margem, 3x
-                        
+
+                        # v6.0: ROE real = pnl / margem real (nao mais 50*3 fixo).
+                        # Margem: usa a guardada na abertura; senao deriva de open*size/lev.
+                        entrada = info_antiga.get('entrada', 0)
+                        margem = info_antiga.get('margem', 0)
+                        if not margem:
+                            try:
+                                open_px = float(p.get("openAvgPrice") or entrada or 0)
+                                size_tot = float(p.get("openTotalPos") or p.get("closeTotalPos") or 0)
+                                lev = float(info_antiga.get('lev') or p.get("leverage") or 1) or 1
+                                margem = (open_px * size_tot / lev) if (open_px and size_tot) else 0
+                            except Exception:
+                                margem = 0
+                        pct_ganho = (pnl / margem * 100) if margem else 0
+
                         emoji = "🟢" if pnl >= 0 else "🔴"
                         sinal = "+" if pnl >= 0 else ""
-                        
+                        roe_str = f" ({sinal}{pct_ganho:.2f}%)" if margem else ""
+
                         m = f"{emoji} <b>POSIÇÃO FECHADA</b>\n━━━━━━━━━━━━━━━\n"
                         m += f"<b>{info_antiga['sym']}/USDT {info_antiga['lado']}</b>\n"
                         m += f"💲 Entrada: ${fmt(entrada)}\n"
-                        m += f"💰 Resultado: <b>${sinal}{pnl:+.4f}</b> ({sinal}{pct_ganho:.2f}%)\n"
+                        m += f"💰 Resultado: <b>${sinal}{pnl:+.4f}</b>{roe_str}\n"
                         m += f"⏱️ Duração: {tempo_aberto}m\n"
                         m += f"📋 Modo: {info_antiga['modo']}"
                         send(m)
+
+                        # v6.0: regista TODOS os fechos (SL/TP/trailing), nao so os manuais
+                        import datetime
+                        trades_history.append({
+                            'symbol': bgsym,
+                            'pnl': pnl,
+                            'roe': pct_ganho,
+                            'timestamp': datetime.datetime.now(),
+                            'hora': datetime.datetime.now().hour,
+                            'duracao': tempo_aberto,
+                        })
                         break
             
             # Cancela ordens orfas (trailing/TP que sobraram do fecho)
@@ -912,6 +980,98 @@ def detect_inside_bar(ohlc):
         return 0.5  # Consolidação (reforça qualquer sinal)
     return 0
 
+# ==================== SCORING (v6.0) ====================
+# Fonte unica de pontuacao, usada pelo analyze() E pela espreitadela.
+# Antes havia duas copias da logica (analyze + peek) com categorias diferentes
+# (4 vs 3) — o aviso e a analise oficial podiam discordar. Agora e o mesmo codigo.
+def pontuar(closes, highs, lows, volumes, funding, ohlc):
+    """Devolve (score, score_breakdown, reasons, cats_concordam, rsi_val)."""
+    r = rsi(closes)
+    e20 = ema_arr(closes, 20)
+    e50 = ema_arr(closes, 50)
+    bull = e20[-1] > e50[-1]
+    ml, sl_, hist = macd(closes)
+    vol_recente = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 1
+    vol_medio = sum(volumes[-25:-5]) / 20 if len(volumes) >= 25 else vol_recente
+    vol_ratio = vol_recente / vol_medio if vol_medio else 1
+
+    engulfing = detect_engulfing(ohlc)
+    rejection = detect_rejection(ohlc)
+    inside_bar = detect_inside_bar(ohlc)
+
+    score = 0.0
+    score_breakdown = {}
+    reasons = []
+
+    # RSI (0 a ±3)
+    rsi_score = 0.0
+    if r < 30:
+        rsi_score = 3.0; reasons.append("RSI sobrevendido")
+    elif r < 40:
+        rsi_score = 1.5
+    elif r > 70:
+        rsi_score = -3.0; reasons.append("RSI sobrecomprado")
+    elif r > 60:
+        rsi_score = -1.5
+    score += rsi_score; score_breakdown['RSI'] = rsi_score
+
+    # EMA (0 a ±2)
+    ema_score = 2.0 if bull else -2.0
+    reasons.append("EMA bullish" if bull else "EMA bearish")
+    score += ema_score; score_breakdown['EMA'] = ema_score
+
+    # MACD (0 a ±2)
+    macd_score = 0.0
+    if ml > sl_ and hist > 0:
+        macd_score = 2.0; reasons.append("MACD bullish")
+    elif ml < sl_ and hist < 0:
+        macd_score = -2.0; reasons.append("MACD bearish")
+    score += macd_score; score_breakdown['MACD'] = macd_score
+
+    # Volume (0 a ±1)
+    vol_score = 0.0
+    if vol_ratio > 1.3 and score > 0:
+        vol_score = 1.0; reasons.append("Volume↑")
+    elif vol_ratio < 0.6:
+        vol_score = -0.5; reasons.append("Volume baixo")
+    score += vol_score; score_breakdown['Volume'] = vol_score
+
+    # Funding Rate (0 a ±1)
+    funding_score = 0.0
+    if score > 0 and funding > 0.03:
+        funding_score -= 1.0; reasons.append(f"Funding alto ({funding:+.3%})")
+    elif score < 0 and funding < -0.03:
+        funding_score += 1.0; reasons.append(f"Funding baixo ({funding:+.3%})")
+    score += funding_score; score_breakdown['Funding'] = funding_score
+
+    # Candlestick Patterns (0 a ±2.5)
+    pattern_score = 0.0
+    if engulfing > 0 and score > 0:
+        pattern_score += engulfing; reasons.append("Engulfing bullish ✅")
+    elif engulfing < 0 and score < 0:
+        pattern_score += engulfing; reasons.append("Engulfing bearish ✅")
+    if rejection != 0:
+        pattern_score += rejection
+        reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
+    if inside_bar > 0 and score != 0:
+        pattern_score += inside_bar
+        reasons.append("Consolidação bullish" if score > 0 else "Consolidação bearish")
+    score += pattern_score; score_breakdown['Padrões'] = pattern_score
+
+    score = round(score, 1)
+
+    # Confluencia por 4 categorias independentes
+    direcao = 1 if score > 0 else -1
+    categorias = {
+        'tendencia': ema_score + macd_score,
+        'momento':   rsi_score,
+        'volume':    vol_score,
+        'contexto':  funding_score + pattern_score,
+    }
+    cats_concordam = sum(1 for v in categorias.values() if v != 0 and (1 if v > 0 else -1) == direcao)
+    score_breakdown['_cats'] = cats_concordam
+    return score, score_breakdown, reasons, cats_concordam, r
+
 # ==================== ANALISE ====================
 def analyze():
     global last_analysis
@@ -919,149 +1079,29 @@ def analyze():
     signals = []
     for pair, sym, bgsym in PAIRS:
         try:
-            # ===== BITGET OHLC =====
             candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
             if not candles:
                 print(f"❌ Sem dados {bgsym}")
                 continue
-            
-            # Extrai dados (formato Bitget: [ts, open, high, low, close, vol_base, vol_quote])
+
             ohlc = candles
             closes = [float(c[4]) for c in ohlc]
             highs = [float(c[2]) for c in ohlc]
             lows = [float(c[3]) for c in ohlc]
             volumes = [float(c[5]) if len(c) > 5 else 1.0 for c in ohlc]
-            
-            # ===== BITGET TICKER =====
+
             price, _ = bg_get_ticker(bgsym)
             if not price:
                 print(f"❌ Sem preço {bgsym}")
                 continue
-            
-            # Indicadores (MESMO código que antes)
-            r = rsi(closes)
+
             e20 = ema_arr(closes, 20)
             e50 = ema_arr(closes, 50)
-            bull = e20[-1] > e50[-1]
-            ml, sl_, hist = macd(closes)
             atr_val = atr(highs, lows, closes)
-            vol_recente = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 1
-            vol_medio = sum(volumes[-25:-5]) / 20 if len(volumes) >= 25 else vol_recente
-            vol_ratio = vol_recente / vol_medio if vol_medio else 1
-            
-            # Funding Rate (Bitget)
             funding = get_funding_rate(bgsym)
-            
-            # Candlestick Patterns
-            engulfing = detect_engulfing(ohlc)
-            rejection = detect_rejection(ohlc)
-            inside_bar = detect_inside_bar(ohlc)
-            
-            score = 0.0
-            score_breakdown = {}
-            reasons = []
-            
-            # RSI (0 a ±3)
-            rsi_score = 0.0
-            if r < 30:
-                rsi_score = 3.0
-                reasons.append("RSI sobrevendido")
-            elif r < 40:
-                rsi_score = 1.5
-            elif r > 70:
-                rsi_score = -3.0
-                reasons.append("RSI sobrecomprado")
-            elif r > 60:
-                rsi_score = -1.5
-            score += rsi_score
-            score_breakdown['RSI'] = rsi_score
-            
-            # EMA (0 a ±2)
-            ema_score = 0.0
-            if bull:
-                ema_score = 2.0
-                reasons.append("EMA bullish")
-            else:
-                ema_score = -2.0
-                reasons.append("EMA bearish")
-            score += ema_score
-            score_breakdown['EMA'] = ema_score
-            
-            # MACD (0 a ±2)
-            macd_score = 0.0
-            if ml > sl_ and hist > 0:
-                macd_score = 2.0
-                reasons.append("MACD bullish")
-            elif ml < sl_ and hist < 0:
-                macd_score = -2.0
-                reasons.append("MACD bearish")
-            score += macd_score
-            score_breakdown['MACD'] = macd_score
-            
-            # Volume (0 a ±1)
-            vol_score = 0.0
-            if vol_ratio > 1.3 and score > 0:
-                vol_score = 1.0
-                reasons.append("Volume↑")
-            elif vol_ratio < 0.6:
-                vol_score = -0.5
-                reasons.append("Volume baixo")
-            score += vol_score
-            score_breakdown['Volume'] = vol_score
-            
-            # Funding Rate (0 a ±1)
-            funding_score = 0.0
-            if score > 0 and funding > 0.03:
-                funding_score -= 1.0
-                reasons.append(f"Funding alto ({funding:+.3%})")
-            elif score < 0 and funding < -0.03:
-                funding_score += 1.0
-                reasons.append(f"Funding baixo ({funding:+.3%})")
-            score += funding_score
-            score_breakdown['Funding'] = funding_score
-            
-            # Candlestick Patterns (0 a ±2.5)
-            pattern_score = 0.0
-            if engulfing > 0 and score > 0:
-                pattern_score += engulfing
-                reasons.append("Engulfing bullish ✅")
-            elif engulfing < 0 and score < 0:
-                pattern_score += engulfing
-                reasons.append("Engulfing bearish ✅")
-            
-            if rejection != 0:
-                pattern_score += rejection
-                reasons.append("Rejection" + (" bullish" if rejection > 0 else " bearish"))
-            
-            if inside_bar > 0:
-                if score > 0:
-                    pattern_score += inside_bar
-                    reasons.append("Consolidação bullish")
-                elif score < 0:
-                    pattern_score += inside_bar
-                    reasons.append("Consolidação bearish")
-            
-            score += pattern_score
-            score_breakdown['Padrões'] = pattern_score
-            
-            # Arredonda score para 1 decimal
-            score = round(score, 1)
 
-            # ===== CONFLUENCIA POR CATEGORIAS (v5.18) =====
-            # Agrupa indicadores em 4 familias independentes. Conta quantas
-            # CATEGORIAS apontam na mesma direcao do score (sinal real != soma inflada
-            # por 2 indicadores da mesma familia, ex: EMA + MACD que medem ambos tendencia)
-            direcao = 1 if score > 0 else -1
-            categorias = {
-                'tendencia': ema_score + macd_score,                 # EMA + MACD
-                'momento':   rsi_score,                              # RSI
-                'volume':    vol_score,                              # Volume
-                'contexto':  funding_score + pattern_score,          # Funding + Padroes
-            }
-            cats_concordam = sum(1 for v in categorias.values() if v != 0 and (1 if v > 0 else -1) == direcao)
-
-            # Guarda para diagnostico
-            score_breakdown['_cats'] = cats_concordam
+            score, score_breakdown, reasons, cats_concordam, r = pontuar(
+                closes, highs, lows, volumes, funding, ohlc)
 
             print(f"{sym}: RSI={r:.1f} score={score:+.1f} cats={cats_concordam} funding={funding:+.3%}")
 
@@ -1072,24 +1112,22 @@ def analyze():
                 continue
 
             # 2. Cooldown por par: nao repetir sinal do mesmo par dentro de COOLDOWN_MIN
+            #    v6.0: o cooldown e marcado DEPOIS (em enviar_sinal/execucao), nao aqui,
+            #    para um sinal que falhe a entrada nao bloquear o par 30 min em falso.
             ultimo = ultimo_sinal_par.get(bgsym, 0)
             if abs(score) >= SCORE_MANUAL and (time.time() - ultimo) < COOLDOWN_MIN * 60:
                 restante = int((COOLDOWN_MIN*60 - (time.time()-ultimo)) / 60)
                 print(f"  ⏭️ {sym} em cooldown ({restante}min restantes)")
                 continue
 
-            # SIGNALS
+            # SIGNALS (sem marcar cooldown aqui)
             if score >= SCORE_AUTO:
-                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🟢 LONG MUITO FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "AUTO"))
             elif score <= -SCORE_AUTO:
-                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🔴 SHORT MUITO FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "AUTO"))
             elif score >= SCORE_MANUAL:
-                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🟢 LONG FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "MANUAL"))
             elif score <= -SCORE_MANUAL:
-                ultimo_sinal_par[bgsym] = time.time()
                 signals.append(((sym, price, 0, r, "🔴 SHORT FORTE", score, score_breakdown, reasons, atr_val), ohlc, e20, e50, bgsym, "MANUAL"))
 
         except Exception as e:
@@ -1152,8 +1190,10 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
         else: send(cap)
         # Log entrada automatica
         log_msg(f"ENTRADA AUTO | {sym:6s} | {('LONG' if 'LONG' in label else 'SHORT'):5s} | ${fmt(price):>10s} | SL ${fmt(sl):>10s}")
-        # Executa automático com sizing por risco
-        executar_trade(sig, bgsym, entrada_valor, "hibrido", entrada_tipo)
+        # Executa automático com sizing por risco. Cooldown só se a entrada vingar.
+        ok = executar_trade(sig, bgsym, entrada_valor, "hibrido", entrada_tipo)
+        if ok:
+            ultimo_sinal_par[bgsym] = time.time()
     else:
         # ENTRADA MANUAL (score 4-5 ou -4 a -5) COM BOTÕES
         cap  = f"{TAG}{'↑' if 'LONG' in label else '↓'} <b>{sym}/USD — {label}</b>\n━━━━━━━━━━━━━━━\n"
@@ -1178,6 +1218,7 @@ def enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL"):
         ]
         
         pending[CHAT_ID] = (sig, ohlc, e20, e50, bgsym)
+        ultimo_sinal_par[bgsym] = time.time()   # v6.0: alerta enviado -> respeita cooldown
         buf = make_chart(ohlc, price, sl, tp1, tp2, sym, label, e20, e50)
         if buf: send_photo(buf, cap)
         else: send_with_buttons(cap, buttons)
@@ -1195,59 +1236,54 @@ def forcar_teste(symbol):
     
     pair, sym, bgsym = alvo
     try:
-        # ===== BITGET OHLC =====
         candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
         if not candles:
             send(f"❌ Erro ao obter dados de {sym}"); return
-        
+
         ohlc = candles
         closes = [float(c[4]) for c in ohlc]
         highs = [float(c[2]) for c in ohlc]
         lows = [float(c[3]) for c in ohlc]
-        
-        # ===== BITGET TICKER =====
+        volumes = [float(c[5]) if len(c) > 5 else 1.0 for c in ohlc]
+
         price, _ = bg_get_ticker(bgsym)
         if not price:
             send(f"❌ Erro ao obter preço de {sym}"); return
-        
-        # Indicadores
-        r = rsi(closes)
+
         e20 = ema_arr(closes, 20)
         e50 = ema_arr(closes, 50)
-        bull = e20[-1] > e50[-1]
         atr_val = atr(highs, lows, closes)
-        
-        # Score breakdown
-        score_breakdown = {}
-        reasons = []
-        
-        if r < 30:
-            score_breakdown['RSI'] = 3.0
-            reasons.append("RSI sobrevendido")
-        elif r > 70:
-            score_breakdown['RSI'] = -3.0
-            reasons.append("RSI sobrecomprado")
-        else:
-            score_breakdown['RSI'] = 0.0
-        
-        score_breakdown['EMA'] = 2.0 if bull else -2.0
-        reasons.append("EMA " + ("bullish" if bull else "bearish"))
-        
-        label = "🟢 LONG FORTE" if bull else "🔴 SHORT FORTE"
-        score = sum(score_breakdown.values())
-        
-        # Novo formato: (sym, price, 0, rsi, label, score, score_breakdown, reasons, atr_val)
+        funding = get_funding_rate(bgsym)
+
+        # v6.0: mesma pontuacao que a analise oficial (antes /teste so usava RSI+EMA)
+        score, score_breakdown, reasons, cats, r = pontuar(
+            closes, highs, lows, volumes, funding, ohlc)
+
+        if score >= SCORE_AUTO:      label = "🟢 LONG MUITO FORTE"
+        elif score <= -SCORE_AUTO:   label = "🔴 SHORT MUITO FORTE"
+        elif score >= SCORE_MANUAL:  label = "🟢 LONG FORTE"
+        elif score <= -SCORE_MANUAL: label = "🔴 SHORT FORTE"
+        elif score > 0:              label = "🟢 LONG fraco"
+        else:                        label = "🔴 SHORT fraco"
+
+        bull = score > 0
         sig = (sym, price, 0, r, label, score, score_breakdown, reasons, atr_val)
 
-        # Open Interest informativo (v5.21) - nao afeta o score
+        # Open Interest informativo (nao afeta o score)
         oi_linha = oi_contexto(bgsym, price_sobe=bull)
 
-        msg_teste = f"🧪 <b>TESTE: {sym}</b>\n━━━━━━━━━━━━━━━\n💲 ${price:,.2f}\n📊 RSI: {r:.1f}\n⚡ {label}"
+        msg_teste = (f"🧪 <b>TESTE: {sym}</b>\n━━━━━━━━━━━━━━━\n💲 ${fmt(price)}\n"
+                     f"📊 RSI: {r:.1f} | Score: {score:+.1f} | {cats}/4 cats\n⚡ {label}")
         if oi_linha:
             msg_teste += f"\n{oi_linha}"
         send(msg_teste)
-        enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL")
-        
+
+        # So mostra o painel de entrada (botoes) se for mesmo sinal >= manual.
+        if abs(score) >= SCORE_MANUAL:
+            enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo="MANUAL")
+        else:
+            send("ℹ️ Score abaixo do limiar — sem painel de entrada.")
+
     except Exception as e:
         send(f"⚠️ Erro teste {sym}: {str(e)[:80]}")
         print(f"Teste error {sym}: {e}")
@@ -1261,9 +1297,9 @@ def get_contract_specs(bgsym):
     if bgsym in _contract_specs:
         return _contract_specs[bgsym]
     try:
-        resp = requests.get(f"{BG_API}/api/v2/mix/market/contracts",
-            params={"symbol":bgsym, "productType":"USDT-FUTURES"}, timeout=10).json()
-        if resp.get("code") == "00000" and resp.get("data"):
+        resp = http_get_json(f"{BG_API}/api/v2/mix/market/contracts",
+            params={"symbol":bgsym, "productType":"USDT-FUTURES"}, timeout=10)
+        if resp and resp.get("code") == "00000" and resp.get("data"):
             d = resp["data"][0]
             specs = {
                 "pricePlace":   int(d.get("pricePlace", 2)),
@@ -1334,7 +1370,11 @@ def mt_exec(args):
         send(f"⚠️ Já tem {par}"); return
     
     is_long = side == 'L'
-    
+
+    # v6.0: instancia "alerta" nao executa
+    if not PRINCIPAL:
+        send("📢 Esta instância está em modo <b>alerta</b> (ROLE=alerta) e não executa ordens."); return
+
     send(f"⏳ Abrindo {par} {('LONG' if is_long else 'SHORT')}...")
     
     try:
@@ -1367,44 +1407,49 @@ def mt_exec(args):
             sl = price + sl_dist
             tp = price - tp_dist
         
-        # Arredonda preços para a precisão CORRETA de cada par (v5.27)
+        # Arredonda preços para a precisão CORRETA de cada par
         sl = ajustar_preco(par, sl)
         tp = ajustar_preco(par, tp)
         
-        # Tamanho (ajustado à precisão de quantidade do par)
+        # Tamanho TOTAL (ajustado à precisão de quantidade do par)
         size = ajustar_qtd(par, notional / price)
         
         # Set leverage
         bg_set_leverage(par, alav)
         time.sleep(1)
         
-        # ABRE ORDEM (50% TP) — metades ajustadas à precisão do par
-        meia = ajustar_qtd(par, size / 2)
-        result = bg_place_order(par, is_long, meia, sl, tp)
-        
+        # v6.0 HÍBRIDO CORRETO: abre a posição INTEIRA (size), depois fecha metade
+        # por limit em TP1 e deixa a outra metade com trailing. Antes abria só metade
+        # mas reportava o notional inteiro (posição real era ½ do anunciado).
+        result = bg_place_order(par, is_long, size, sl)   # SL preset; sem TP (gerido abaixo)
         if result.get("code") != "00000":
             send(f"❌ Erro ao abrir: {result.get('msg','?')}"); return
-        
         time.sleep(0.5)
+
+        metade = ajustar_qtd(par, size / 2)
+        resto = ajustar_qtd(par, size - metade)
+        rtp = bg_close_limit(par, is_long, metade, tp)            # TP1 fecha 50%
+        rtr = bg_place_trailing(par, is_long, resto, tp, CALLBACK_RATIO)  # trailing nos 50%
+        ok_tp = rtp.get("code") == "00000"
+        ok_tr = rtr.get("code") == "00000"
         
-        # Coloca trailing (50%)
-        bg_place_trailing(par, is_long, meia, tp, CALLBACK_RATIO)
-        
-        # Sucesso!
+        # Sucesso! (risco/ganho sobre o size INTEIRO)
         risco = abs(sl - price) * size
         ganho = abs(tp - price) * size
         
         m = f"✅ <b>POSIÇÃO ABERTA!</b>\n━━━━━━━━━━━━━━━\n"
         m += f"{'↑' if is_long else '↓'} <b>{par} {'LONG' if is_long else 'SHORT'}</b> (HÍBRIDO)\n"
-        m += f"💲 Entrada: ${price:,.2f}\n"
-        m += f"🛑 SL: ${sl:,.2f}\n"
-        m += f"🎯 TP1: ${tp:,.2f}\n"
+        m += f"💲 Entrada: ${fmt(price)}\n"
+        m += f"🛑 SL: ${fmt(sl)}\n"
+        m += f"🎯 TP1: ${fmt(tp)}\n"
         m += "━━━━━━━━━━━━━━━\n"
         m += f"⚡ Alavancagem: {alav:.1f}x\n"
         m += f"💰 Margem: ${margem:.2f}\n"
         m += f"📏 Notional: ${notional:.2f}\n"
-        m += f"💔 Risco máximo: ${risco:+.2f}\n"
-        m += f"💎 Ganho potencial: ${ganho:+.2f}"
+        m += f"📊 Size: {size}\n"
+        m += f"📋 TP1 50% [{'ok' if ok_tp else 'FALHOU'}] + Trailing [{'ok' if ok_tr else 'FALHOU'}]\n"
+        m += f"💔 Risco máximo: ${risco:.2f}\n"
+        m += f"💎 Ganho potencial: ${ganho:.2f}"
         
         send(m)
         
@@ -1413,6 +1458,8 @@ def mt_exec(args):
             'entrada': price,
             'tempo_abertura': time.time(),
             'modo': 'hibrido',
+            'lev': alav,
+            'margem': margem,
             'sym': par.replace("USDT", ""),
             'lado': 'LONG' if is_long else 'SHORT'
         }
@@ -2076,8 +2123,9 @@ last_peek = 0
 peek_avisado = {}          # {bgsym: ultimo_score_avisado} — evita spam
 
 def calc_score_peek(bgsym):
-    """Calcula o score de um par de forma leve, para a espreitadela.
-    Replica a mesma logica do analyze() mas so devolve (score, cats, price)."""
+    """Espreitadela: usa a MESMA funcao de pontuacao do analyze (pontuar).
+    Diferenca: nao chama o funding (poupa 1 chamada/par); passa funding=0.
+    Devolve (score, cats, price)."""
     candles = bg_get_ohlcv(bgsym, granularity="60", limit=100)
     if not candles:
         return None
@@ -2088,30 +2136,7 @@ def calc_score_peek(bgsym):
     price, _ = bg_get_ticker(bgsym)
     if not price:
         return None
-    r = rsi(closes)
-    e20 = ema_arr(closes, 20); e50 = ema_arr(closes, 50)
-    bull = e20[-1] > e50[-1]
-    ml, sl_, hist = macd(closes)
-    vol_recente = sum(volumes[-5:])/5 if len(volumes)>=5 else 1
-    vol_medio = sum(volumes[-25:-5])/20 if len(volumes)>=25 else vol_recente
-    vol_ratio = vol_recente/vol_medio if vol_medio else 1
-
-    score = 0.0
-    rsi_s = 3.0 if r<30 else 1.5 if r<40 else -3.0 if r>70 else -1.5 if r>60 else 0.0
-    score += rsi_s
-    ema_s = 2.0 if bull else -2.0
-    score += ema_s
-    macd_s = 2.0 if (ml>sl_ and hist>0) else -2.0 if (ml<sl_ and hist<0) else 0.0
-    score += macd_s
-    vol_s = 1.0 if (vol_ratio>1.3 and score>0) else -0.5 if vol_ratio<0.6 else 0.0
-    score += vol_s
-    score = round(score, 1)
-    # confluencia (3 categorias na versao leve: tendencia, momento, volume)
-    direcao = 1 if score>0 else -1
-    cats = 0
-    if (ema_s+macd_s)*direcao > 0: cats += 1
-    if rsi_s*direcao > 0: cats += 1
-    if vol_s*direcao > 0: cats += 1
+    score, _bd, _reasons, cats, _r = pontuar(closes, highs, lows, volumes, 0.0, candles)
     return score, cats, price
 
 def espreitar():
@@ -2124,7 +2149,7 @@ def espreitar():
             if not res:
                 continue
             score, cats, price = res
-            log_msg(f"PEEK | {bgsym:6s} | score {score:+.1f} | cats {cats}/3 | ${price:,.4f}")
+            log_msg(f"PEEK | {bgsym:6s} | score {score:+.1f} | cats {cats}/4 | ${price:,.4f}")
             # avisa so se cruzar o limite E mudou desde o ultimo aviso (evita spam)
             if abs(score) >= LIMITE_AVISO:
                 ja = peek_avisado.get(bgsym)
@@ -2252,17 +2277,22 @@ def process_replies():
 
 # ==================== LOOP ====================
 estado = "🔬 DRY RUN" if DRY_RUN else "💵 REAL"
-print(f"Bot {VERSAO} — {estado}")
+papel = "PRINCIPAL (executa)" if PRINCIPAL else "ALERTA (não executa)"
+print(f"Bot {VERSAO} — {estado} — {papel}")
 
-# Reconciliacao no arranque (v5.19): recupera posicoes apos restart do Railway
-if not DRY_RUN:
+# Sincroniza relogio com a Bitget antes de qualquer chamada assinada (v6.0)
+bg_sync_time()
+
+# Reconciliacao no arranque (v5.19): recupera posicoes apos restart.
+# So a instancia principal gere posicoes.
+if not DRY_RUN and PRINCIPAL:
     reconciliar_posicoes()
 
 sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
-msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ Usa os botões 👇"
+msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado} | 🎭 {papel}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ Usa os botões 👇"
 send_com_teclado_fixo(msg_arranque)   # instala o teclado fixo (nunca desaparece)
 mostrar_menu_principal()              # abre logo o painel inline no arranque
-log_msg(f"BOT ARRANQUE — {BOT_ID} — {VERSAO} — {len(PAIRS)} pares ({', '.join(p[1] for p in PAIRS)})")
+log_msg(f"BOT ARRANQUE — {BOT_ID} — {VERSAO} — {papel} — {len(PAIRS)} pares ({', '.join(p[1] for p in PAIRS)})")
 
 _dia_atual = time.strftime("%Y-%m-%d", time.gmtime())
 last_peek = time.time()   # primeira espreitadela só daqui a 5 min (evita duplicar com a 1ª análise)
@@ -2288,11 +2318,18 @@ while True:
         print(f"A analisar mercado ({ANALYSIS_INTERVAL}s)...")
         try:
             signals = analyze()
-            for item in signals:
-                sig, ohlc, e20, e50, bgsym, tipo = item
+            if signals:
+                # v6.0: escolhe o sinal mais forte do ciclo (AUTO tem prioridade,
+                # depois |score|). Antes agia no 1º da lista -> viés sistemático p/ BTC.
+                def _peso(item):
+                    sig, *_rest, tipo = item
+                    score = sig[5]
+                    return (1 if tipo == "AUTO" else 0, abs(score))
+                melhor = max(signals, key=_peso)
+                sig, ohlc, e20, e50, bgsym, tipo = melhor
                 enviar_sinal(sig, ohlc, e20, e50, bgsym, tipo)
-                break
-            if not signals: print("Sem sinais fortes.")
+            else:
+                print("Sem sinais fortes.")
         except Exception as e:
             print(f"Erro: {e}")
     time.sleep(3)
