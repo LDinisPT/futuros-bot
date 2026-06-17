@@ -1,4 +1,4 @@
-import os, time, requests, io, hmac, hashlib, base64, json, socket
+import os, time, requests, io, hmac, hashlib, base64, json, socket, csv
 from datetime import datetime
 import matplotlib
 matplotlib.use('Agg')
@@ -48,7 +48,7 @@ BG_API = "https://api.bitget.com"
 MAX_LEV = 3
 CALLBACK_RATIO = 2.5
 DRY_RUN = False
-VERSAO = "v6.0"
+VERSAO = "v6.1"
 BOT_NAME = "FuturesScan Bot de Dinis"
 
 # ===== PAPEL DA INSTANCIA (v6.0) =====
@@ -66,6 +66,28 @@ PRINCIPAL = ROLE != "alerta"
 HTTP_RETRIES = 3          # tentativas em chamadas Bitget antes de desistir
 HTTP_BACKOFF = 0.8        # segundos base entre tentativas (cresce: 0.8, 1.6, 2.4)
 _time_offset = 0          # offset (ms) entre relogio local e servidor Bitget
+
+# ===== ESTRATEGIA DE SCORE (v6.1) =====
+# Permite testar duas teses sem mexer no codigo:
+#   reversao (default) -> RSI de reversao a media (peso ±3) + volume so confirma longs
+#   momentum           -> RSI alinhado com a tendencia (peso ±1.5) + volume simetrico
+# Muda so a variavel de ambiente ESTRATEGIA. O CSV regista qual foi usada em cada trade.
+ESTRATEGIA = os.environ.get("ESTRATEGIA", "reversao").strip().lower()
+if ESTRATEGIA not in ("reversao", "momentum"):
+    ESTRATEGIA = "reversao"
+
+# ===== REGISTO CSV sinal->resultado (v6.1) =====
+# Grava UMA linha por trade AUTO fechado: features do sinal + resultado real.
+# Serve para afinar os pesos do score com dados reais e comparar reversao vs momentum.
+# ATENCAO: no Railway o disco e efemero (apaga a cada deploy). Usa um Volume do
+# Railway montado em CSV_DIR, OU usa /csv no Telegram para puxar o ficheiro antes de
+# cada redeploy.
+CSV_DIR = os.environ.get("CSV_DIR", os.path.dirname(os.path.abspath(__file__)))
+CSV_PATH = os.path.join(CSV_DIR, "trades.csv")
+CSV_COLS = ["data","estrategia","symbol","tipo","direcao","entrada","sl","tp1",
+            "score","cats","rsi","rsi_score","ema_score","macd_score","vol_score",
+            "funding","funding_score","pattern_score","atr","lev","margem",
+            "pnl","roe_pct","duracao_min","resultado"]
 DAILY_LOSS_WARNING = 5.0
 MAX_NOTIONAL = 500.0
 SL_MIN_PCT = 0.6  # SL minimo: 0.6% da entrada (evita stops colados em mercado calmo)
@@ -192,6 +214,87 @@ def send_photo(buf, caption):
     except Exception as e:
         print(f"Erro foto: {e}")
         send(caption)
+
+def send_document(path, caption=""):
+    """Envia um ficheiro (ex: o CSV) como documento no Telegram."""
+    try:
+        with open(path, "rb") as f:
+            requests.post(f"{API}/sendDocument",
+                          data={"chat_id":CHAT_ID,"caption":caption,"parse_mode":"HTML"},
+                          files={"document":(os.path.basename(path), f)}, timeout=30)
+        return True
+    except Exception as e:
+        print(f"Erro send_document: {e}")
+        send(f"❌ Não consegui enviar o ficheiro: {str(e)[:60]}")
+        return False
+
+# ===== CSV sinal->resultado (v6.1) =====
+def csv_registar(features, resultado):
+    """Acrescenta uma linha ao trades.csv combinando features do sinal + resultado.
+    features: dict guardado na abertura. resultado: dict com pnl/roe/duracao."""
+    try:
+        existe = os.path.isfile(CSV_PATH)
+        linha = {
+            "data": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "estrategia": features.get("estrategia", ESTRATEGIA),
+            "symbol": features.get("symbol",""),
+            "tipo": features.get("tipo",""),
+            "direcao": features.get("direcao",""),
+            "entrada": features.get("entrada",""),
+            "sl": features.get("sl",""),
+            "tp1": features.get("tp1",""),
+            "score": features.get("score",""),
+            "cats": features.get("cats",""),
+            "rsi": features.get("rsi",""),
+            "rsi_score": features.get("rsi_score",""),
+            "ema_score": features.get("ema_score",""),
+            "macd_score": features.get("macd_score",""),
+            "vol_score": features.get("vol_score",""),
+            "funding": features.get("funding",""),
+            "funding_score": features.get("funding_score",""),
+            "pattern_score": features.get("pattern_score",""),
+            "atr": features.get("atr",""),
+            "lev": features.get("lev",""),
+            "margem": features.get("margem",""),
+            "pnl": round(resultado.get("pnl",0), 4),
+            "roe_pct": round(resultado.get("roe",0), 2),
+            "duracao_min": resultado.get("duracao",""),
+            "resultado": "WIN" if resultado.get("pnl",0) >= 0 else "LOSS",
+        }
+        with open(CSV_PATH, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_COLS)
+            if not existe:
+                w.writeheader()
+            w.writerow(linha)
+        log_msg(f"CSV | {linha['symbol']} {linha['direcao']} | {linha['resultado']} | pnl {linha['pnl']} | {linha['estrategia']}")
+    except Exception as e:
+        print(f"Erro csv_registar: {e}")
+
+def features_do_sinal(sig, bgsym, tipo, sl, tp1, lev, margem, funding):
+    """Constroi o dict de features a partir do sinal, para guardar na posicao."""
+    sym, price, _, r, label, score, bd, reasons, atr_val = sig
+    return {
+        "estrategia": ESTRATEGIA,
+        "symbol": sym,
+        "tipo": tipo,
+        "direcao": "LONG" if "LONG" in label else "SHORT",
+        "entrada": round(price, 6),
+        "sl": round(sl, 6),
+        "tp1": round(tp1, 6),
+        "score": score,
+        "cats": bd.get("_cats",""),
+        "rsi": round(r, 1),
+        "rsi_score": bd.get("RSI",""),
+        "ema_score": bd.get("EMA",""),
+        "macd_score": bd.get("MACD",""),
+        "vol_score": bd.get("Volume",""),
+        "funding": round(funding, 5),
+        "funding_score": bd.get("Funding",""),
+        "pattern_score": bd.get("Padrões",""),
+        "atr": round(atr_val, 6),
+        "lev": lev,
+        "margem": round(margem, 2),
+    }
 
 def edit_message(message_id, msg, buttons=None):
     """Edita uma mensagem existente (para menus inline que se transformam)."""
@@ -687,7 +790,7 @@ def reconciliar_posicoes():
         print(f"Erro reconciliar_posicoes: {e}")
 
 
-def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
+def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem", tipo="AUTO"):
     """Abre uma posicao. Devolve True se abriu com sucesso, False caso contrario."""
     sym, price, _, rsi_v, label, score, score_breakdown, reasons, atr_val = sig
     is_long = "LONG" in label
@@ -781,7 +884,8 @@ def executar_trade(sig, bgsym, valor, modo="normal", tipo_valor="margem"):
         "modo": modo,
         "lev": lev,
         "margem": margem,
-        "tempo_abertura": time.time()
+        "tempo_abertura": time.time(),
+        "features": features_do_sinal(sig, bgsym, tipo, sl, tp1, lev, margem, get_funding_rate(bgsym))
     }
     return True
 
@@ -847,15 +951,18 @@ def verificar_posicoes_fechadas():
                         send(m)
 
                         # v6.0: regista TODOS os fechos (SL/TP/trailing), nao so os manuais
-                        import datetime
                         trades_history.append({
                             'symbol': bgsym,
                             'pnl': pnl,
                             'roe': pct_ganho,
-                            'timestamp': datetime.datetime.now(),
-                            'hora': datetime.datetime.now().hour,
+                            'timestamp': datetime.now(),
+                            'hora': datetime.now().hour,
                             'duracao': tempo_aberto,
                         })
+                        # v6.1: linha no CSV (features do sinal + resultado real)
+                        feats = info_antiga.get("features")
+                        if feats:
+                            csv_registar(feats, {"pnl": pnl, "roe": pct_ganho, "duracao": tempo_aberto})
                         break
             
             # Cancela ordens orfas (trailing/TP que sobraram do fecho)
@@ -1003,16 +1110,29 @@ def pontuar(closes, highs, lows, volumes, funding, ohlc):
     score_breakdown = {}
     reasons = []
 
-    # RSI (0 a ±3)
+    # RSI — depende da estrategia
     rsi_score = 0.0
-    if r < 30:
-        rsi_score = 3.0; reasons.append("RSI sobrevendido")
-    elif r < 40:
-        rsi_score = 1.5
-    elif r > 70:
-        rsi_score = -3.0; reasons.append("RSI sobrecomprado")
-    elif r > 60:
-        rsi_score = -1.5
+    if ESTRATEGIA == "momentum":
+        # RSI como momentum/tendencia (alinhado), peso max ±1.5
+        if r >= 65:
+            rsi_score = 1.5; reasons.append("RSI momentum alta")
+        elif r >= 55:
+            rsi_score = 0.75
+        elif r <= 35:
+            rsi_score = -1.5; reasons.append("RSI momentum baixa")
+        elif r <= 45:
+            rsi_score = -0.75
+        # 45-55: zona neutra (0)
+    else:
+        # RSI de reversao a media (default), peso max ±3.0
+        if r < 30:
+            rsi_score = 3.0; reasons.append("RSI sobrevendido")
+        elif r < 40:
+            rsi_score = 1.5
+        elif r > 70:
+            rsi_score = -3.0; reasons.append("RSI sobrecomprado")
+        elif r > 60:
+            rsi_score = -1.5
     score += rsi_score; score_breakdown['RSI'] = rsi_score
 
     # EMA (0 a ±2)
@@ -1028,12 +1148,23 @@ def pontuar(closes, highs, lows, volumes, funding, ohlc):
         macd_score = -2.0; reasons.append("MACD bearish")
     score += macd_score; score_breakdown['MACD'] = macd_score
 
-    # Volume (0 a ±1)
+    # Volume — depende da estrategia
     vol_score = 0.0
-    if vol_ratio > 1.3 and score > 0:
-        vol_score = 1.0; reasons.append("Volume↑")
-    elif vol_ratio < 0.6:
-        vol_score = -0.5; reasons.append("Volume baixo")
+    if ESTRATEGIA == "momentum":
+        # simetrico: volume alto confirma a direcao do score em AMBOS os lados
+        if vol_ratio > 1.3 and score != 0:
+            vol_score = 1.0 if score > 0 else -1.0
+            reasons.append("Volume↑")
+        elif vol_ratio < 0.6 and score != 0:
+            # volume baixo = menos conviccao -> reduz magnitude nos dois sentidos
+            vol_score = -0.5 if score > 0 else 0.5
+            reasons.append("Volume baixo")
+    else:
+        # assimetrico (original): so confirma longs
+        if vol_ratio > 1.3 and score > 0:
+            vol_score = 1.0; reasons.append("Volume↑")
+        elif vol_ratio < 0.6:
+            vol_score = -0.5; reasons.append("Volume baixo")
     score += vol_score; score_breakdown['Volume'] = vol_score
 
     # Funding Rate (0 a ±1)
@@ -1727,6 +1858,7 @@ def mostrar_ajuda():
     m  = f"🤖 <b>COMANDOS ({VERSAO})</b>\n━━━━━━━━━━━━━━━\n"
     m += "/saldo /posicoes /ganhos /stats\n"
     m += "/fechar SOL /teste LTC /limpar /ajuda\n"
+    m += "/csv (exportar) /estrategia (ver tese ativa)\n"
     m += "━━━━━━━━━━━━━━━\n"
     m += "<b>📊 MANUAL TRADE:</b>\n"
     m += "/mt PAR L/S MARGEM ALAV\n"
@@ -2229,6 +2361,21 @@ def process_replies():
             continue
         if text.startswith("/fechar"):
             menu_fechar(); continue
+        if text.startswith("/csv"):
+            if os.path.isfile(CSV_PATH):
+                try:
+                    n = max(0, sum(1 for _ in open(CSV_PATH)) - 1)  # linhas - cabecalho
+                except Exception:
+                    n = "?"
+                send_document(CSV_PATH, caption=f"📊 trades.csv — {n} trades registados\nEstratégia atual: <b>{ESTRATEGIA}</b>")
+            else:
+                send("ℹ️ Ainda não há trades registados no CSV (só grava quando uma posição AUTO/manual fecha).")
+            continue
+        if text.startswith("/estrategia") or text.startswith("/estratégia"):
+            send(f"🎯 Estratégia ativa: <b>{ESTRATEGIA}</b>\n"
+                 f"<i>(muda na variável de ambiente ESTRATEGIA = reversao | momentum e reinicia)</i>\n"
+                 f"📊 CSV: {'existe' if os.path.isfile(CSV_PATH) else 'ainda vazio'} — usa /csv para exportar.")
+            continue
         if text.startswith("/menu"): mostrar_menu_principal(); continue
         if text.startswith("/ajuda"): mostrar_ajuda(); continue
         if text.startswith("/start"): mostrar_menu_principal(); continue
@@ -2270,7 +2417,7 @@ def process_replies():
                         continue
                 sig, ohlc, e20, e50, bgsym = pending[CHAT_ID]
                 send(f"⏳ A processar ${valor} ({tipo})...")
-                executar_trade(sig, bgsym, valor, modo, tipo)
+                executar_trade(sig, bgsym, valor, modo, tipo_valor=tipo, tipo="MANUAL")
                 pending.pop(CHAT_ID, None)
             except Exception as e:
                 send(f"⚠️ Erro: {e}")
@@ -2289,7 +2436,7 @@ if not DRY_RUN and PRINCIPAL:
     reconciliar_posicoes()
 
 sizing_desc = f"risco {RISK_PCT:.0f}% conta" if RISK_AUTO_ENABLED else "$50 margem fixa"
-msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado} | 🎭 {papel}\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n✅ Usa os botões 👇"
+msg_arranque = f"🤖 <b>{TAG}{BOT_NAME} {VERSAO}</b>\n{estado} | 🎭 {papel}\n🎯 Estratégia: <b>{ESTRATEGIA}</b> (RSI {'momentum ±1.5 + volume simétrico' if ESTRATEGIA=='momentum' else 'reversão ±3 + volume long'})\n⚡ Máx {MAX_LEV}x | Polling 15min\n🎯 Pares validados: {len(PAIRS)} ({', '.join(p[1] for p in PAIRS)})\n⚡ AUTOMÁTICO: Score ≥ {SCORE_AUTO:.0f} entra ({sizing_desc}, híbrido)\n🔗 Confluência mín: {MIN_CATEGORIAS}/4 categorias\n⏱️ Cooldown: {COOLDOWN_MIN}min por par\n🚨 Circuit breaker: ${DAILY_LOSS_LIMIT:.0f} perda/dia\n📊 CSV sinal→resultado ativo (/csv para exportar)\n✅ Usa os botões 👇"
 send_com_teclado_fixo(msg_arranque)   # instala o teclado fixo (nunca desaparece)
 mostrar_menu_principal()              # abre logo o painel inline no arranque
 log_msg(f"BOT ARRANQUE — {BOT_ID} — {VERSAO} — {papel} — {len(PAIRS)} pares ({', '.join(p[1] for p in PAIRS)})")
